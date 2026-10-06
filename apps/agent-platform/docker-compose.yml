@@ -1,0 +1,9 @@
+services:
+  agent-platform:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      LOG_LEVEL: info
+      LOG_FORMAT: pretty # use "json" to see what production/CloudWatch logs look like
