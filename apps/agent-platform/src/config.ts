@@ -30,6 +30,8 @@ export type TaskWorkerConfig =
 
 export interface Config {
   port: number;
+  /** Web origins whose pages may open the realtime WebSocket. */
+  allowedOrigins: string[];
   logLevel: LogLevel;
   logFormat: LogFormat;
   llm: LLMConfig;
@@ -37,8 +39,10 @@ export interface Config {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const port = parsePort(env.PORT ?? "3000");
   return {
-    port: parsePort(env.PORT ?? "3000"),
+    port,
+    allowedOrigins: parseOrigins(env.ALLOWED_ORIGINS, port),
     logLevel: parseOneOf("LOG_LEVEL", env.LOG_LEVEL ?? "info", ["debug", "info", "warn", "error"]),
     // Default to readable logs in a terminal, JSON everywhere else.
     logFormat: parseOneOf("LOG_FORMAT", env.LOG_FORMAT ?? (process.stdout.isTTY ? "pretty" : "json"), [
@@ -99,6 +103,19 @@ function parsePort(raw: string): number {
     throw new Error(`Invalid PORT: "${raw}" (expected an integer 1-65535)`);
   }
   return port;
+}
+
+// Default: pages served from this port on localhost, i.e. a web UI served by
+// the agent itself, or reached through an SSM tunnel on the same port.
+function parseOrigins(raw: string | undefined, port: number): string[] {
+  if (!raw?.trim()) return [`http://localhost:${port}`, `http://127.0.0.1:${port}`];
+  return raw.split(",").map((entry) => {
+    const origin = entry.trim();
+    if (!URL.canParse(origin) || new URL(origin).origin !== origin) {
+      throw new Error(`Invalid ALLOWED_ORIGINS entry: "${origin}" (expected an origin like https://example.com)`);
+    }
+    return origin;
+  });
 }
 
 function parseOneOf<T extends string>(name: string, raw: string, allowed: readonly T[]): T {

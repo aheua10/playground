@@ -1,6 +1,7 @@
 import { loadConfig, type LLMConfig, type TaskWorkerConfig } from "./config.ts";
 import { InMemoryConversationStore } from "./conversation/in-memory-conversation-store.ts";
 import { ConversationEvents } from "./events/conversation-events.ts";
+import { attachRealtime } from "./http/realtime.ts";
 import { createHttpServer } from "./http/server.ts";
 import { AnthropicProvider } from "./llm/anthropic-provider.ts";
 import type { LLMProvider } from "./llm/llm-provider.ts";
@@ -52,10 +53,12 @@ const toolExecutor = new ToolExecutor({ registry: toolRegistry });
 const runtime = new AgentRuntime({ llm, store, toolExecutor, logger, events });
 startTaskNotifier({ events, runtime });
 const server = createHttpServer({ runtime, tasks, logger });
+const realtime = attachRealtime(server, { runtime, events, logger, allowedOrigins: config.allowedOrigins });
 
 server.listen(config.port, () => {
   logger.info("server.started", {
     port: config.port,
+    realtime: { path: "/realtime", allowedOrigins: config.allowedOrigins },
     llmProvider: llm.name,
     model: config.llm.provider === "anthropic" ? config.llm.model : undefined,
     tools: toolExecutor.definitions().map((tool) => tool.name),
@@ -71,7 +74,8 @@ server.listen(config.port, () => {
 function createLLMProvider(llmConfig: LLMConfig): LLMProvider {
   switch (llmConfig.provider) {
     case "stub":
-      return new StubLLMProvider();
+      // A short pause between words, so streaming is visible in the chat client.
+      return new StubLLMProvider({ wordDelayMs: 30 });
     case "anthropic":
       return new AnthropicProvider({ model: llmConfig.model, effort: llmConfig.effort });
   }
@@ -100,10 +104,12 @@ async function createTaskWorker(workerConfig: TaskWorkerConfig, llm: LLMProvider
 }
 
 // Containers stop us with SIGTERM (docker stop, ECS deploys). Stop accepting
-// connections, let in-flight requests finish, record running tasks as
-// interrupted (they live in memory), then exit. Force-exit if that takes too long.
+// connections, close WebSockets (which cancels their turns), let in-flight
+// requests finish, record running tasks as interrupted (they live in memory),
+// then exit. Force-exit if that takes too long.
 function shutdown(signal: string): void {
   logger.info("server.stopping", { signal });
+  realtime.close();
   server.close(() => {
     void tasks.shutdown().finally(() => process.exit(0));
   });

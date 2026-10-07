@@ -3,6 +3,7 @@ import type { Logger } from "../logger.ts";
 import type { AgentRuntime, TurnInput } from "../runtime/agent-runtime.ts";
 import { describeTask } from "../tasks/task.ts";
 import type { TaskManager } from "../tasks/task-manager.ts";
+import { CONVERSATION_ID_PATTERN, MAX_MESSAGE_CHARS } from "./input-rules.ts";
 
 // HTTP transport adapter. Its whole job:
 //   1. parse + validate the HTTP request (untrusted client input)
@@ -16,11 +17,10 @@ import type { TaskManager } from "../tasks/task-manager.ts";
 //   POST /messages            { conversationId, message } -> { conversationId, turnId, reply }
 //   GET  /conversations/:id         stored history, including tool calls and results (debugging)
 //   GET  /conversations/:id/tasks   the conversation's background tasks and their state
+//
+// The realtime channel (WebSocket, /realtime) shares this server; see realtime.ts.
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const MAX_MESSAGE_CHARS = 32_000;
-// Restricted charset: conversationId will end up in logs, DB keys, maybe paths.
-const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export interface HttpServerDeps {
   runtime: Pick<AgentRuntime, "runTurn" | "getHistory">;
