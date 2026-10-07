@@ -4,7 +4,7 @@ A learning project: an agent runtime built without an agent framework, so the
 agent loop, the tool trust boundary, and the provider abstraction are all
 visible in our own code.
 
-**Status: Phase 3 complete.**
+**Status: Phase 4 complete.**
 - **Phase 1:** conversations over HTTP, an explicit agent loop, a native tool
   (`get_current_time`) behind a trust boundary, and two LLM providers: a
   deterministic stub (default, no API key) and Anthropic (Claude).
@@ -13,8 +13,11 @@ visible in our own code.
 - **Phase 3:** the coding worker, a second agent that writes code in a
   per-task workspace and runs commands in locked-down Docker containers.
 
-Not yet: working on an existing repository, MCP, persistence, authentication,
-realtime/voice. Deploying: see [DEPLOY.md](DEPLOY.md).
+- **Phase 4:** tasks can work on an existing repository: a checkout on a
+  task branch, committed for the worker, and pushed on request.
+
+Not yet: MCP, persistence, authentication, realtime/voice. Deploying: see
+[DEPLOY.md](DEPLOY.md).
 
 ## Run it
 
@@ -68,6 +71,9 @@ the coding worker it only writes a `NOTES.md` (and runs one command with
 | `SANDBOX`           | `none`                         | `none` (file tools only) `docker` (also `run_command`) |
 | `SANDBOX_IMAGE`     | `node:24-slim`                 | image for sandbox containers            |
 | `SANDBOX_NETWORK`   | `none`                         | `none` `bridge` (needed for `npm install`) |
+| `REPOSITORIES`      | (none)                         | `name=url[#baseBranch]`, comma-separated: the repositories tasks may use |
+| `GIT_TOKEN`         | (none)                         | token for private clones and pushes (host-side git only) |
+| `ALLOW_GIT_PUSH`    | `false`                        | `true` registers `publish_task`         |
 
 `LOG_LEVEL=debug` also logs the full payload of every LLM request (system
 prompt, tool definitions, messages): exactly what the model is told.
@@ -193,6 +199,40 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up --build
 Without `SANDBOX=docker` the worker still runs, but can only edit files.
 Run the agent as a non-root user: sandbox containers use its uid.
 
+## Working on a repository
+
+With `REPOSITORIES` set, `start_coding_task` takes an optional `repository`.
+Its schema enum *is* the allowlist, so the model can only name a configured
+repository, never supply a URL. "Create a /health endpoint for this project"
+then runs like this:
+
+```
+start_coding_task(repository) ─► TaskCheckout.prepare: clone, branch agent/<taskId>
+                              ─► worker loop: read/write files, run_command in the sandbox
+                              ─► platform commits the attempt ("Agent Platform" author)
+publish_task (when asked)     ─► push agent/<taskId> (never the base branch, never forced)
+```
+
+- **The `.git` directory lives outside the sandbox.** The work tree is
+  `<WORKSPACES_DIR>/<taskId>` and is mounted into sandbox containers. The git
+  directory is `<WORKSPACES_DIR>/.git-dirs/<taskId>.git` and is only used by
+  the host. If `.git` were inside the work tree, sandboxed code could write
+  `.git/config` (`core.fsmonitor`, filters) or a hook, and the host's next
+  `git status` or `git commit` would run it *outside* the sandbox.
+  `test/task-checkout.test.ts` plants exactly that and checks nothing runs.
+- **Host-side git is pinned down** (`src/repositories/git.ts`):
+  - argument arrays, never a shell
+  - no system or global config, and no credential helpers from the host
+  - hooks and fsmonitor are off
+  - `GIT_TOKEN` is passed only as per-command config in the environment:
+    never in URLs, argv, files or logs
+- **The worker never runs git.** It's told it is on branch `agent/<taskId>`;
+  the platform commits after each successful attempt, excluding
+  `node_modules`. Revisions add commits on the same branch.
+- **Publishing is opt-in** (`ALLOW_GIT_PUSH=true`). It's limited to a
+  completed task of the calling conversation, and the result links to
+  GitHub's compare page, so you open the pull request yourself.
+
 ## Layout and dependency direction
 
 ```
@@ -228,6 +268,11 @@ src/
     workspace-tools.ts       list/read/write/delete_file
     command-sandbox.ts       CommandSandbox contract + run_command tool
     docker-command-sandbox.ts  one locked-down container per command
+  repositories/
+    git.ts                   hardened host-side git runner
+    repository-catalog.ts    the REPOSITORIES allowlist
+    task-checkout.ts         clone / commit / push, git dir outside the sandbox
+    publish-task-tool.ts     publish_task
   core/                      provider-neutral messages, tool definitions, KeyedMutex
 ```
 
@@ -235,7 +280,7 @@ src/
 http ──► runtime ──► LLMProvider (interface)      ◄── anthropic, stub
               ├────► ToolExecutor ──► ToolRegistry ◄── native tools, task tools (later: MCP tools)
               │                                          └─► TaskManager ──► TaskWorker, TaskStore
-              │                                                               └─ CodingWorker ─► runAgentLoop, Workspace, CommandSandbox
+              │                                                               └─ CodingWorker ─► runAgentLoop, Workspace, CommandSandbox, TaskCheckout
               └────► ConversationStore (interface) ◄── in-memory
 everything ──► core/
 ```
@@ -270,6 +315,8 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
 | `task.stale_update_dropped` | debug: late result from a superseded attempt ignored |
 | `worker.started`      | a coding worker attempt began (workspace path); its own `llm.*`/`tool.*` lines carry `taskId`, `attempt`, `agent=coding-worker` |
 | `sandbox.runs_as_root`| warning: sandboxed commands would run as uid 0              |
+| `git.cloned` / `git.committed` / `git.pushed` | repository checkout, per-attempt commit, publish (repository, branch, commit) |
+| `git.clone_failed` / `git.push_failed` | clone or push failed (details in the log, a short reason to the model) |
 | `http.rejected`       | 4xx: client input refused at the transport                 |
 | `http.error`          | 5xx: unexpected error (details only in logs)               |
 
@@ -293,10 +340,10 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
 - Task work runs inside the server process. At scale it moves to a queue and
   separate workers; `TaskManager` keeps its interface.
 - Task updates are pull-only (see Background tasks).
-- The worker starts from an empty workspace: it can't yet work on an existing
-  repository, and workspaces are never cleaned up.
+- Workspaces and checkouts are never cleaned up. Each task clones the whole
+  base branch; submodules and Git LFS aren't supported.
 - The HTTP API has no authentication: keep it private (see DEPLOY.md).
 - Responses are not streamed (needed later for voice).
-- A tool that ignores its abort signal keeps running after a timeout; the
-  runtime just stops waiting. Real isolation (separate process/container)
-  comes with tools that execute code.
+- An in-process tool that ignores its abort signal keeps running after a
+  timeout; the runtime just stops waiting. (Sandboxed commands don't have
+  this problem: their container is removed.)

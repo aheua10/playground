@@ -14,6 +14,10 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+# git: tasks clone, commit and push repositories (always on the host side, never in the sandbox).
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 # Static Docker CLI, used only when SANDBOX=docker (see docker-compose.sandbox.yml).
 COPY --from=docker:29-cli /usr/local/bin/docker /usr/local/bin/docker
 # Task workspaces, owned by the unprivileged user (a volume in docker-compose.yml).

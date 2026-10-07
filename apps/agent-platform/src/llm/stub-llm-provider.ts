@@ -1,4 +1,5 @@
 import type { AssistantMessage, Message } from "../core/messages.ts";
+import type { ToolDefinition } from "../core/tool-definition.ts";
 import type { LLMProvider, LLMRequest, LLMResponse } from "./llm-provider.ts";
 
 // A deterministic, rule-based fake LLM for local development and tests. It
@@ -8,31 +9,47 @@ import type { LLMProvider, LLMRequest, LLMResponse } from "./llm-provider.ts";
 // As the conversation agent: if the last message is a tool result, it replies
 // by quoting that result. Otherwise the first matching rule below picks a tool
 // call (only tools that are actually offered count); "the task" means the most
-// recent taskId seen in the conversation. With no match it echoes the message.
+// recent taskId seen in the conversation, and "this project" means the first
+// repository start_coding_task offers. With no match it echoes the message.
 //
 // As the coding worker (recognised by being offered write_file): it writes a
 // NOTES.md with the requirements, runs one command if run_command is offered,
 // then summarizes. Enough to exercise the worker, workspace and sandbox.
 
+type RuleContext = { latestTaskId: string | undefined; tools: ToolDefinition[] };
+
 type Rule = {
   tool: string;
   pattern: RegExp;
   /** Returns the tool input, or undefined if the rule can't apply (e.g. no task yet). */
-  input: (text: string, latestTaskId: string | undefined) => object | undefined;
+  input: (text: string, context: RuleContext) => object | undefined;
 };
 
 const RULES: Rule[] = [
-  { tool: "cancel_task", pattern: /\b(cancel|stop|abort)\b/i, input: (_, taskId) => (taskId ? { taskId } : undefined) },
+  {
+    tool: "cancel_task",
+    pattern: /\b(cancel|stop|abort)\b/i,
+    input: (_, { latestTaskId }) => (latestTaskId ? { taskId: latestTaskId } : undefined),
+  },
+  {
+    tool: "publish_task",
+    pattern: /\b(publish|push)\b/i,
+    input: (_, { latestTaskId }) => (latestTaskId ? { taskId: latestTaskId } : undefined),
+  },
   { tool: "list_tasks", pattern: /\b(status|progress|done|ready|finished)\b/i, input: () => ({}) },
   {
     tool: "revise_task",
     pattern: /\b(instead|also|change|add)\b/i,
-    input: (text, taskId) => (taskId ? { taskId, change: text } : undefined),
+    input: (text, { latestTaskId }) => (latestTaskId ? { taskId: latestTaskId, change: text } : undefined),
   },
   {
     tool: "start_coding_task",
     pattern: /^(create|build|write|implement|make)\b/i,
-    input: (text) => ({ instruction: text }),
+    input: (text, { tools }) => {
+      const [repository] = offeredRepositories(tools);
+      const meansProject = /\b(this|the|my|our) (project|repo|repository)\b/i.test(text);
+      return repository && meansProject ? { instruction: text, repository } : { instruction: text };
+    },
   },
   {
     tool: "get_current_time",
@@ -43,6 +60,12 @@ const RULES: Rule[] = [
     },
   },
 ];
+
+function offeredRepositories(tools: ToolDefinition[]): string[] {
+  const start = tools.find((tool) => tool.name === "start_coding_task");
+  const properties = start?.inputSchema.properties as { repository?: { enum?: string[] } } | undefined;
+  return properties?.repository?.enum ?? [];
+}
 
 export class StubLLMProvider implements LLMProvider {
   readonly name = "stub";
@@ -62,7 +85,7 @@ export class StubLLMProvider implements LLMProvider {
     const latestTaskId = findLatestTaskId(request.messages);
     for (const rule of RULES) {
       if (!offered.has(rule.tool) || !rule.pattern.test(text)) continue;
-      const input = rule.input(text, latestTaskId);
+      const input = rule.input(text, { latestTaskId, tools: request.tools });
       if (input === undefined) continue;
       return this.#callTool(rule.tool, input);
     }

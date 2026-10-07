@@ -63,7 +63,7 @@ LOG_FORMAT=json
 WORKSPACES_HOST_DIR=/srv/agent-workspaces
 DOCKER_GID=$(stat -c %g /var/run/docker.sock)
 EOF
-sudoedit .env   # add ANTHROPIC_API_KEY=...
+sudoedit .env   # add ANTHROPIC_API_KEY=..., and the repository settings below
 
 # Run it. It restarts with the Docker daemon, so it also survives reboots.
 sudo docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
@@ -72,6 +72,21 @@ sudo docker compose -f docker-compose.yml -f docker-compose.sandbox.yml logs -f
 
 `.env` serves two purposes: compose reads it to fill in `WORKSPACES_HOST_DIR`
 and `DOCKER_GID`, and the agent reads it for its configuration.
+
+To let tasks work on your repositories, add these to `.env`:
+
+```sh
+# name=url or name=url#baseBranch, comma-separated
+REPOSITORIES=playground=https://github.com/aheua10/playground.git
+# fine-grained token: only these repositories, Contents read & write
+GIT_TOKEN=github_pat_...
+# lets "publish it" push agent/<taskId> branches; false keeps the work on the instance
+ALLOW_GIT_PUSH=true
+```
+
+The token is only ever used by host-side git: the model and the sandbox
+never see it. Pushes only go to `agent/...` branches, never forced; you open
+the pull request from the link the agent gives you.
 
 Optional: to let the worker run `npm install`, add `SANDBOX_NETWORK=bridge`.
 That gives sandbox containers outbound network access. They still have no
