@@ -10,9 +10,10 @@ import type { ToolRegistry } from "./tool-registry.ts";
 // runs unless it passes these gates, in order:
 //
 //   1. exists      only registered tools can run; the model can't invent capabilities
-//   2. permitted   policy check (Phase 1: every registered tool is read-only, so all
-//                  are allowed; permissions, approvals and filesystem/command limits
-//                  plug in here once tools can have side effects)
+//   2. permitted   policy check. None yet: the only side effects so far are task
+//                  start/revise/cancel, which TaskManager scopes to the calling
+//                  conversation. Permissions, approvals and filesystem/command
+//                  limits plug in here once tools can touch files or run commands.
 //   3. valid       input must match the tool's JSON Schema
 //   4. bounded     runs with a timeout and the turn's cancellation signal
 //

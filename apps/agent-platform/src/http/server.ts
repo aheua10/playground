@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Logger } from "../logger.ts";
 import type { AgentRuntime, TurnInput } from "../runtime/agent-runtime.ts";
+import { describeTask } from "../tasks/task.ts";
+import type { TaskManager } from "../tasks/task-manager.ts";
 
 // HTTP transport adapter. Its whole job:
 //   1. parse + validate the HTTP request (untrusted client input)
@@ -12,7 +14,8 @@ import type { AgentRuntime, TurnInput } from "../runtime/agent-runtime.ts";
 // Routes:
 //   GET  /health              liveness check for Docker / load balancers
 //   POST /messages            { conversationId, message } -> { conversationId, turnId, reply }
-//   GET  /conversations/:id   stored history, including tool calls and results (debugging)
+//   GET  /conversations/:id         stored history, including tool calls and results (debugging)
+//   GET  /conversations/:id/tasks   the conversation's background tasks and their state
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_MESSAGE_CHARS = 32_000;
@@ -21,6 +24,7 @@ const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export interface HttpServerDeps {
   runtime: Pick<AgentRuntime, "runTurn" | "getHistory">;
+  tasks: Pick<TaskManager, "list">;
   logger: Logger;
 }
 
@@ -91,12 +95,15 @@ async function route(
     return await deps.runtime.runTurn(input, signal);
   }
 
-  const conversationPath = /^\/conversations\/([^/]+)$/.exec(path);
+  const conversationPath = /^\/conversations\/([^/]+)(\/tasks)?$/.exec(path);
   if (conversationPath) {
     requireMethod(method, "GET");
     // The allowed charset needs no percent-decoding, so match the raw segment.
     const conversationId = conversationPath[1]!;
     if (!CONVERSATION_ID_PATTERN.test(conversationId)) throw new HttpError(400, "Invalid conversationId");
+    if (conversationPath[2]) {
+      return { conversationId, tasks: (await deps.tasks.list(conversationId)).map(describeTask) };
+    }
     const messages = await deps.runtime.getHistory(conversationId);
     if (messages.length === 0) throw new HttpError(404, "Conversation not found");
     // `raw` is opaque provider state (e.g. signed thinking blocks): omit it for readability.

@@ -24,6 +24,9 @@ import { SYSTEM_PROMPT } from "./system-prompt.ts";
 //
 // The LLM DECIDES which actions it wants. The runtime CONTROLS whether and how
 // they run (ToolExecutor), how many steps a turn may take, and what is saved.
+//
+// Long-running work never happens inside a turn: tools like start_coding_task
+// hand it to the TaskManager and return at once, so turns stay short.
 
 const DEFAULT_MAX_STEPS = 8;
 

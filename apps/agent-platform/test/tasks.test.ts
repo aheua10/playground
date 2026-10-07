@@ -3,7 +3,10 @@ import { test } from "node:test";
 import { SimulatedCodingWorker } from "../src/tasks/simulated-coding-worker.ts";
 import { TaskManager } from "../src/tasks/task-manager.ts";
 import { InMemoryTaskStore } from "../src/tasks/task-store.ts";
+import { createTaskTools } from "../src/tasks/task-tools.ts";
 import { TaskFailedError } from "../src/tasks/task-worker.ts";
+import { ToolExecutor } from "../src/tools/tool-executor.ts";
+import { ToolRegistry } from "../src/tools/tool-registry.ts";
 import { captureLogger, ControlledWorker, eventually } from "./helpers.ts";
 
 function setup(options: { maxRunningPerConversation?: number; honourAbort?: boolean } = {}) {
@@ -147,4 +150,33 @@ test("SimulatedCodingWorker reports each step, and stops when aborted", async ()
   );
   controller.abort();
   await assert.rejects(pending, { name: "AbortError" });
+});
+
+test("task tools act on the calling conversation, which the model cannot choose", async () => {
+  const { manager } = setup();
+  const registry = new ToolRegistry();
+  for (const tool of createTaskTools(manager)) registry.register(tool);
+  const executor = new ToolExecutor({ registry });
+  const { logger } = captureLogger();
+  const run = (conversationId: string, name: string, input: unknown) =>
+    executor.execute(
+      { id: "call", name, input },
+      { conversationId, turnId: "t", signal: new AbortController().signal, log: logger },
+    );
+
+  const started = await run("c1", "start_coding_task", { instruction: "Create a server" });
+  const { taskId, status } = JSON.parse(started.content);
+  assert.equal(status, "running");
+
+  // Another conversation can't see or touch it...
+  const foreign = await run("c2", "cancel_task", { taskId });
+  assert.ok(foreign.isError);
+  assert.match(foreign.content, /No task/);
+  // ...and the model can't smuggle a conversation id in through the input.
+  const smuggled = await run("c2", "start_coding_task", { instruction: "x", conversationId: "c1" });
+  assert.ok(smuggled.isError);
+  assert.match(smuggled.content, /must NOT have additional properties/);
+
+  const listed = await run("c1", "list_tasks", {});
+  assert.deepEqual(JSON.parse(listed.content).map((t: { taskId: string }) => t.taskId), [taskId]);
 });

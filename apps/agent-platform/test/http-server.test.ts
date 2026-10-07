@@ -6,21 +6,31 @@ import { createHttpServer } from "../src/http/server.ts";
 import { StubLLMProvider } from "../src/llm/stub-llm-provider.ts";
 import { createLogger } from "../src/logger.ts";
 import { AgentRuntime } from "../src/runtime/agent-runtime.ts";
+import { SimulatedCodingWorker } from "../src/tasks/simulated-coding-worker.ts";
+import { TaskManager } from "../src/tasks/task-manager.ts";
+import { InMemoryTaskStore } from "../src/tasks/task-store.ts";
+import { createTaskTools } from "../src/tasks/task-tools.ts";
 import { createGetCurrentTimeTool } from "../src/tools/get-current-time.ts";
 import { ToolExecutor } from "../src/tools/tool-executor.ts";
 import { ToolRegistry } from "../src/tools/tool-registry.ts";
-import { FIXED_NOW } from "./helpers.ts";
+import { eventually, FIXED_NOW } from "./helpers.ts";
 
 const logger = createLogger({ level: "error", format: "json", write: () => {} });
+const tasks = new TaskManager({
+  store: new InMemoryTaskStore(),
+  worker: new SimulatedCodingWorker({ stepDelayMs: 50 }),
+  logger,
+});
 const registry = new ToolRegistry();
 registry.register(createGetCurrentTimeTool(() => FIXED_NOW));
+for (const tool of createTaskTools(tasks)) registry.register(tool);
 const runtime = new AgentRuntime({
   llm: new StubLLMProvider(),
   store: new InMemoryConversationStore(),
   toolExecutor: new ToolExecutor({ registry }),
   logger,
 });
-const server = createHttpServer({ runtime, logger });
+const server = createHttpServer({ runtime, tasks, logger });
 let baseUrl: string;
 
 before(async () => {
@@ -29,6 +39,7 @@ before(async () => {
 });
 
 after(async () => {
+  await tasks.shutdown();
   await new Promise((resolve) => server.close(resolve));
 });
 
@@ -72,6 +83,25 @@ test("GET /conversations/:id returns the stored turn, including the tool call an
   assert.equal(messages[1].toolCalls[0].name, "get_current_time");
   assert.equal((await fetch(baseUrl + "/conversations/unknown")).status, 404);
   assert.equal((await fetch(baseUrl + "/conversations/bad%20id")).status, 400);
+});
+
+test("a coding task runs in the background while the conversation continues", async () => {
+  const say = async (message: string) =>
+    (await (await postJson("/messages", { conversationId: "task-1", message })).json()).reply as string;
+  const listTasks = async () => (await (await fetch(baseUrl + "/conversations/task-1/tasks")).json()).tasks;
+
+  // The turn returns as soon as the task has started.
+  assert.match(await say("Create a TypeScript server"), /start_coding_task returned: .*"status":"running"/);
+  // While it runs, a later message revises it: attempt 2 with both requirements.
+  assert.match(await say("Use Fastify instead of Express"), /revise_task returned: .*"attempt":2/);
+  const [running] = await listTasks();
+  assert.equal(running.status, "running");
+  assert.deepEqual(running.requirements, ["Create a TypeScript server", "Use Fastify instead of Express"]);
+
+  await eventually(async () => (await listTasks())[0].status === "completed");
+  assert.match((await listTasks())[0].result, /Use Fastify instead of Express/);
+  assert.match(await say("Is it done?"), /list_tasks returned: .*"status":"completed"/);
+  assert.match(await say("Cancel it"), /cancel_task failed: .*already completed/);
 });
 
 test("POST /messages rejects invalid input with 400", async () => {
