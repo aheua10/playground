@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import { test } from "node:test";
 import { hashToken } from "../src/auth/tokens.ts";
 import { loadConfig } from "../src/config.ts";
@@ -42,4 +43,17 @@ test("ALLOWED_ORIGINS: localhost on PORT by default; full origins only", () => {
   for (const bad of ["ui.example.com", "https://ui.example.com/", "https://ui.example.com/app"]) {
     assert.throws(() => loadConfig({ AUTH: "none", ALLOWED_ORIGINS: bad }), /Invalid ALLOWED_ORIGINS entry/, bad);
   }
+});
+
+test("STORE: SQLite at ./data by default, or in memory", () => {
+  assert.deepEqual(loadConfig({ AUTH: "none" }).store, {
+    kind: "sqlite",
+    path: path.resolve("data/agent-platform.db"),
+  });
+  assert.deepEqual(loadConfig({ AUTH: "none", DATABASE_PATH: "/srv/agent/db.sqlite" }).store, {
+    kind: "sqlite",
+    path: "/srv/agent/db.sqlite",
+  });
+  assert.deepEqual(loadConfig({ AUTH: "none", STORE: "memory" }).store, { kind: "memory" });
+  assert.throws(() => loadConfig({ AUTH: "none", STORE: "postgres" }), /Invalid STORE/);
 });

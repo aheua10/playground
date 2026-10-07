@@ -12,8 +12,11 @@ services:
       PORT: "3000"
       LOG_FORMAT: ${LOG_FORMAT:-pretty} # "json" shows what production/CloudWatch logs look like
       WORKSPACES_DIR: /workspaces
+      DATABASE_PATH: /data/agent-platform.db
     volumes:
       - workspaces:/workspaces # task workspaces survive container restarts
+      - data:/data # conversations and tasks (SQLite) too
 
 volumes:
   workspaces:
+  data:

@@ -1,8 +1,8 @@
 import type { Message } from "../core/messages.ts";
 import type { ConversationStore } from "./conversation-store.ts";
 
-// Process-local storage. Lost on restart, and not shared between instances,
-// so the service must run as a single instance until a real store exists.
+// Process-local storage, lost on restart: for tests and STORE=memory. The
+// server's default is SqliteConversationStore (persistence/).
 export class InMemoryConversationStore implements ConversationStore {
   readonly #conversations = new Map<string, Message[]>();
 

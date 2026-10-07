@@ -132,7 +132,28 @@ export class TaskManager {
     return tasks.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
-  /** On SIGTERM: in-memory work can't survive a restart, so record it as interrupted. */
+  /**
+   * At startup, before anything else runs: tasks the store still lists as
+   * running were cut off by a crash (a clean shutdown records them itself).
+   * Their attempts are gone, so they fail; revising one starts a new attempt
+   * on the same workspace. Returns how many were recovered.
+   */
+  async recoverInterrupted(): Promise<number> {
+    const stale = await this.#store.listByStatus("running");
+    for (const { id } of stale) {
+      await this.#locks.run(id, async () => {
+        const task = await this.#store.get(id);
+        if (!task || task.status !== "running" || this.#running.has(id)) return;
+        this.#transition(task, "failed");
+        task.error = "Interrupted: the server stopped before the task finished.";
+        await this.#save(task, "interrupted");
+        this.#log(task).warn("task.failed", { error: task.error, recovered: true });
+      });
+    }
+    return stale.length;
+  }
+
+  /** On SIGTERM: running attempts live in this process and can't survive a restart, so record them as interrupted. */
   async shutdown(): Promise<void> {
     await Promise.all(
       [...this.#running.keys()].map((taskId) =>

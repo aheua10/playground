@@ -20,9 +20,10 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 # Static Docker CLI, used only when SANDBOX=docker (see docker-compose.sandbox.yml).
 COPY --from=docker:29-cli /usr/local/bin/docker /usr/local/bin/docker
-# Task workspaces, owned by the unprivileged user (a volume in docker-compose.yml).
-RUN mkdir /workspaces && chown node:node /workspaces
+# Task workspaces and the database, owned by the unprivileged user (volumes in docker-compose.yml).
+RUN mkdir /workspaces /data && chown node:node /workspaces /data && chmod 700 /data
 ENV WORKSPACES_DIR=/workspaces
+ENV DATABASE_PATH=/data/agent-platform.db
 USER node
 EXPOSE 3000
 CMD ["node", "--enable-source-maps", "dist/main.js"]

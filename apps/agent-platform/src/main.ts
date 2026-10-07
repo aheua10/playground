@@ -1,5 +1,6 @@
 import { type Authenticator, NoAuthenticator, TokenAuthenticator } from "./auth/authenticator.ts";
 import { type AuthConfig, loadConfig, type LLMConfig, type TaskWorkerConfig } from "./config.ts";
+import type { ConversationStore } from "./conversation/conversation-store.ts";
 import { InMemoryConversationStore } from "./conversation/in-memory-conversation-store.ts";
 import { ConversationEvents } from "./events/conversation-events.ts";
 import { attachRealtime } from "./http/realtime.ts";
@@ -8,6 +9,9 @@ import { AnthropicProvider } from "./llm/anthropic-provider.ts";
 import type { LLMProvider } from "./llm/llm-provider.ts";
 import { StubLLMProvider } from "./llm/stub-llm-provider.ts";
 import { createLogger, type Logger } from "./logger.ts";
+import { openDatabase } from "./persistence/database.ts";
+import { SqliteConversationStore } from "./persistence/sqlite-conversation-store.ts";
+import { SqliteTaskStore } from "./persistence/sqlite-task-store.ts";
 import { tokenAuth } from "./repositories/git.ts";
 import { createPublishTaskTool } from "./repositories/publish-task-tool.ts";
 import { RepositoryCatalog } from "./repositories/repository-catalog.ts";
@@ -18,7 +22,7 @@ import { CodingWorker } from "./tasks/coding-worker.ts";
 import { SimulatedCodingWorker } from "./tasks/simulated-coding-worker.ts";
 import { TaskManager } from "./tasks/task-manager.ts";
 import { startTaskNotifier } from "./tasks/task-notifier.ts";
-import { InMemoryTaskStore } from "./tasks/task-store.ts";
+import { InMemoryTaskStore, type TaskStore } from "./tasks/task-store.ts";
 import { createTaskTools } from "./tasks/task-tools.ts";
 import type { TaskWorker } from "./tasks/task-worker.ts";
 import { createGetCurrentTimeTool } from "./tools/get-current-time.ts";
@@ -32,6 +36,13 @@ import { ToolRegistry } from "./tools/tool-registry.ts";
 const config = loadConfig();
 const logger = createLogger({ level: config.logLevel, format: config.logFormat });
 
+// Durable state: one SQLite file, unless STORE=memory.
+const database = config.store.kind === "sqlite" ? openDatabase(config.store.path) : undefined;
+const conversationStore: ConversationStore = database
+  ? new SqliteConversationStore(database)
+  : new InMemoryConversationStore();
+const taskStore: TaskStore = database ? new SqliteTaskStore(database) : new InMemoryTaskStore();
+
 const llm = createLLMProvider(config.llm);
 const repositories = new RepositoryCatalog(config.worker.kind === "coding" ? config.worker.repositories : []);
 // Like ANTHROPIC_API_KEY, the git token is read from the environment here and
@@ -39,7 +50,9 @@ const repositories = new RepositoryCatalog(config.worker.kind === "coding" ? con
 const gitAuth = tokenAuth(process.env.GIT_TOKEN);
 const worker = await createTaskWorker(config.worker, llm, logger);
 const events = new ConversationEvents(logger);
-const tasks = new TaskManager({ store: new InMemoryTaskStore(), worker, logger, events });
+const tasks = new TaskManager({ store: taskStore, worker, logger, events });
+// Before accepting requests: settle tasks a crash left marked as running.
+const recoveredTasks = await tasks.recoverInterrupted();
 
 const toolRegistry = new ToolRegistry();
 toolRegistry.register(createGetCurrentTimeTool());
@@ -49,9 +62,8 @@ if (config.worker.kind === "coding" && config.worker.allowGitPush) {
   toolRegistry.register(createPublishTaskTool({ tasks, repositories, workspacesDir, gitAuth, logger }));
 }
 
-const store = new InMemoryConversationStore();
 const toolExecutor = new ToolExecutor({ registry: toolRegistry });
-const runtime = new AgentRuntime({ llm, store, toolExecutor, logger, events });
+const runtime = new AgentRuntime({ llm, store: conversationStore, toolExecutor, logger, events });
 startTaskNotifier({ events, runtime });
 const authenticator = createAuthenticator(config.auth);
 const { allowedHosts, allowedOrigins } = config;
@@ -68,7 +80,9 @@ server.listen(config.port, () => {
     llmProvider: llm.name,
     model: config.llm.provider === "anthropic" ? config.llm.model : undefined,
     tools: toolExecutor.definitions().map((tool) => tool.name),
-    conversationStore: "in-memory",
+    store: config.store.kind,
+    databasePath: config.store.kind === "sqlite" ? config.store.path : undefined,
+    recoveredTasks,
     taskWorker: config.worker.kind,
     workspacesDir: config.worker.kind === "coding" ? config.worker.workspacesDir : undefined,
     sandbox: config.worker.kind === "coding" ? config.worker.sandbox.kind : undefined,
@@ -117,13 +131,16 @@ async function createTaskWorker(workerConfig: TaskWorkerConfig, llm: LLMProvider
 
 // Containers stop us with SIGTERM (docker stop, ECS deploys). Stop accepting
 // connections, close WebSockets (which cancels their turns), let in-flight
-// requests finish, record running tasks as interrupted (they live in memory),
-// then exit. Force-exit if that takes too long.
+// requests finish, record running tasks as interrupted (their attempts live in
+// this process), close the database, then exit. Force-exit if that takes too long.
 function shutdown(signal: string): void {
   logger.info("server.stopping", { signal });
   realtime.close();
   server.close(() => {
-    void tasks.shutdown().finally(() => process.exit(0));
+    void tasks
+      .shutdown()
+      .finally(() => database?.close())
+      .finally(() => process.exit(0));
   });
   setTimeout(() => process.exit(1), 10_000).unref();
 }

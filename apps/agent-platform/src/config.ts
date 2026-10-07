@@ -21,6 +21,9 @@ export type LLMConfig =
 /** "tokens": every request needs a bearer token listed (as a hash) in AUTH_TOKENS. "none": no authentication. */
 export type AuthConfig = { kind: "tokens"; tokens: TokenEntry[] } | { kind: "none" };
 
+/** Where conversations and tasks are kept. "memory": lost on restart (tests, throwaway runs). */
+export type StoreConfig = { kind: "sqlite"; path: string } | { kind: "memory" };
+
 export type SandboxConfig = { kind: "none" } | { kind: "docker"; image: string; network: "none" | "bridge" };
 
 export type TaskWorkerConfig =
@@ -37,6 +40,7 @@ export type TaskWorkerConfig =
 export interface Config {
   port: number;
   auth: AuthConfig;
+  store: StoreConfig;
   /** Host names, besides localhost and IP addresses, that requests may be addressed to. */
   allowedHosts: string[];
   /** Web origins whose pages may open the realtime WebSocket. */
@@ -52,6 +56,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     port,
     auth: loadAuthConfig(env),
+    store: loadStoreConfig(env),
     allowedHosts: parseHostnames(env.ALLOWED_HOSTS),
     allowedOrigins: parseOrigins(env.ALLOWED_ORIGINS, port),
     logLevel: parseOneOf("LOG_LEVEL", env.LOG_LEVEL ?? "info", ["debug", "info", "warn", "error"]),
@@ -114,6 +119,12 @@ function parsePort(raw: string): number {
     throw new Error(`Invalid PORT: "${raw}" (expected an integer 1-65535)`);
   }
   return port;
+}
+
+function loadStoreConfig(env: NodeJS.ProcessEnv): StoreConfig {
+  const kind = parseOneOf("STORE", env.STORE ?? "sqlite", ["sqlite", "memory"]);
+  if (kind === "memory") return { kind };
+  return { kind, path: path.resolve(env.DATABASE_PATH ?? "./data/agent-platform.db") };
 }
 
 // Secure by default: without tokens the server refuses to start, unless
