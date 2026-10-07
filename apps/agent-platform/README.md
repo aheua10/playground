@@ -4,7 +4,7 @@ A learning project: an agent runtime built without an agent framework, so the
 agent loop, the tool trust boundary, and the provider abstraction are all
 visible in our own code.
 
-**Status: Phase 4 complete.**
+**Status: Phase 5 complete.**
 - **Phase 1:** conversations over HTTP, an explicit agent loop, a native tool
   (`get_current_time`) behind a trust boundary, and two LLM providers: a
   deterministic stub (default, no API key) and Anthropic (Claude).
@@ -12,11 +12,13 @@ visible in our own code.
   cancel while it carries on.
 - **Phase 3:** the coding worker, a second agent that writes code in a
   per-task workspace and runs commands in locked-down Docker containers.
-
 - **Phase 4:** tasks can work on an existing repository: a checkout on a
   task branch, committed for the worker, and pushed on request.
+- **Phase 5:** a realtime channel. A WebSocket streams replies, tool calls
+  and task updates as they happen, and the agent speaks up on its own when a
+  task finishes.
 
-Not yet: MCP, persistence, authentication, realtime/voice. Deploying: see
+Not yet: MCP, persistence, authentication, voice. Deploying: see
 [DEPLOY.md](DEPLOY.md).
 
 ## Run it
@@ -51,6 +53,13 @@ curl -s localhost:3000/conversations/demo/tasks      # progress, result, workspa
 curl -s localhost:3000/conversations/demo            # the stored turns, with tool calls and results
 ```
 
+Or chat in a terminal, with replies streaming in as they're written:
+
+```sh
+npm run chat              # a new conversation
+npm run chat -- demo      # join "demo": turns sent with curl above show up here too
+```
+
 The stub picks tools by keyword (`time`; `create/build/write/...`; `instead/also/add/change`;
 `status/done`; `cancel/stop`), so all of this works without an API key. As
 the coding worker it only writes a `NOTES.md` (and runs one command with
@@ -74,6 +83,7 @@ the coding worker it only writes a `NOTES.md` (and runs one command with
 | `REPOSITORIES`      | (none)                         | `name=url[#baseBranch]`, comma-separated: the repositories tasks may use |
 | `GIT_TOKEN`         | (none)                         | token for private clones and pushes (host-side git only) |
 | `ALLOW_GIT_PUSH`    | `false`                        | `true` registers `publish_task`         |
+| `ALLOWED_ORIGINS`   | `http://localhost:PORT`, `http://127.0.0.1:PORT` | web origins whose pages may open `/realtime` |
 
 `LOG_LEVEL=debug` also logs the full payload of every LLM request (system
 prompt, tool definitions, messages): exactly what the model is told.
@@ -86,6 +96,7 @@ prompt, tool definitions, messages): exactly what the model is told.
 | `GET /conversations/:id`  | stored history, including tool calls and results (debugging)   |
 | `GET /conversations/:id/tasks` | the conversation's background tasks and their state       |
 | `GET /health`             | liveness check                                                 |
+| `GET /realtime?conversationId=…` | WebSocket upgrade: the [realtime channel](#the-realtime-channel) |
 
 If the client disconnects mid-turn, the turn is cancelled (LLM call and tools
 aborted) and nothing is persisted.
@@ -107,8 +118,9 @@ happens. Every tool call passes `ToolExecutor` (`src/tools/tool-executor.ts`),
 the trust boundary:
 
 1. **exists**: only registered tools run, so the model can't invent capabilities
-2. **permitted**: policy hook. No general policy yet: the only side effects are
-   task start/revise/cancel, scoped to the calling conversation by `TaskManager`
+2. **permitted**: the run's `ToolPolicy` (`src/tools/tool-policy.ts`). Turns the
+   user starts may use every tool; turns the platform starts (task notices)
+   only those marked `readOnly`
 3. **valid**: input must match the tool's JSON Schema (ajv, compiled at startup)
 4. **bounded**: timeout plus the turn's cancellation signal
 
@@ -152,10 +164,9 @@ drives tasks through five tools:
 - **The worker is pluggable** (`TaskWorker`): `CodingWorker` (below) by
   default, or `SimulatedCodingWorker` (`TASK_WORKER=simulated`), which only
   reports fake progress.
-- **Pull, not push (for now).** The agent learns about progress when it calls
-  `get_task`/`list_tasks`, e.g. because the user asks. Telling the user
-  unprompted ("your server is ready") needs a realtime channel, which comes
-  with WebSockets/voice.
+- **Pull and push.** The agent can check on a task (`get_task`,
+  `list_tasks`), and when a task completes or fails the platform tells the
+  conversation itself (see [the realtime channel](#the-realtime-channel)).
 
 ## The coding worker and its sandbox
 
@@ -233,6 +244,79 @@ publish_task (when asked)     ─► push agent/<taskId> (never the base branch,
   completed task of the calling conversation, and the result links to
   GitHub's compare page, so you open the pull request yourself.
 
+## The realtime channel
+
+`GET /realtime?conversationId=…` upgrades to a WebSocket on the same port as
+the REST API (`src/http/realtime.ts`). A client sends messages and receives
+everything that happens in its conversation, as it happens. In `npm run chat`
+with `LLM_PROVIDER=anthropic` (the stub's replies are more literal):
+
+```
+you> What time is it in Asia/Tokyo?
+  [tool] get_current_time {"timeZone":"Asia/Tokyo"}
+agent> It is 9:12 PM in Tokyo.                      ← streamed word by word
+you> Create a hello world script
+  [tool] start_coding_task {"instruction":"Create a hello world script"}
+agent> Started task_d6eb14158c; I'll let you know when it's done.
+  [task_d6eb14158c] started
+  [task_d6eb14158c] progress: Wrote hello.js
+  [task_d6eb14158c] completed
+[platform] Task task_d6eb14158c has completed.     ← nobody asked: the platform starts this turn
+agent> Your hello world script is ready: hello.js prints "Hello, world!".
+```
+
+| Direction        | Message                                          | Meaning |
+| ---------------- | ------------------------------------------------ | ------- |
+| client → server  | `{"type":"message","text":"…"}`                  | start a turn |
+|                  | `{"type":"cancel_turn"}`                         | cancel this socket's turns (running and queued) |
+| server → client  | `{"type":"ready","conversationId":"…"}`          | subscribed |
+|                  | `turn.started` (`initiator`: `user` or `platform`, `text`) | a turn began |
+|                  | `reply.delta` (`text`)                           | the next piece of the reply |
+|                  | `tool.called` (`name`, `input`) / `tool.finished` (`isError`) | tool activity in the turn |
+|                  | `turn.completed` (`reply`) / `turn.failed` (`reason`: `cancelled` or `error`) | the turn ended; `reply` is authoritative |
+|                  | `task.updated` (`change`, `task`)                | `started` `progress` `revised` `completed` `failed` `cancelled` `interrupted` |
+|                  | `{"type":"error","message":"…"}`                 | a client message was rejected |
+
+How it fits together:
+
+```
+AgentRuntime ─┐                         ┌─► WebSocket clients of that conversation
+TaskManager ──┼─► ConversationEvents ───┤
+              │   (in-process bus)      └─► TaskNotifier ─► runtime.notify() on completed/failed
+REST, sockets, notices: every turn publishes the same events
+```
+
+- **Publishers don't know who listens.** The runtime and `TaskManager`
+  publish to `ConversationEvents` (`src/events/`); transports subscribe. A
+  turn sent with curl streams to a socket watching the same conversation, and
+  voice will be one more subscriber. Turn events are published under the turn
+  lock and task events under the task lock, so they arrive in order and two
+  turns never interleave.
+- **Streaming crosses the provider boundary as an observer.**
+  `LLMRequest.onTextDelta` receives reply text as it is generated; the
+  returned response stays authoritative. The Anthropic provider always
+  streams (`client.beta.messages.stream`). Tool-call arguments aren't
+  forwarded: they are acted on only once complete. The loop's
+  `AgentLoopObserver` adds tool calls and results; it can't change anything.
+- **The platform can start a turn.** When a task completes or fails,
+  `TaskNotifier` calls `runtime.notify()`. That turn starts with a `notice`
+  message (sent to Claude as user input wrapped in `<platform_notice>`), and
+  runs under the `READ_ONLY` tool policy: nobody asked for it, so the model may
+  look things up but not start, revise, cancel or publish anything. That also
+  means a notice can't cause another notice. The model is still offered every
+  tool, so the request prefix and its prompt cache stay the same; a refused
+  call becomes an error result (`tool.rejected`, `reason=not_permitted`).
+  Notices queue behind the user's turn, like any other turn.
+- **Who may connect.** Browsers don't apply CORS to WebSockets: without a
+  check, any web page open in your browser could connect to `localhost:3000`
+  and drive the agent. The handshake's `Origin` must be in `ALLOWED_ORIGINS`.
+  Clients that aren't browsers (curl, `npm run chat`) send no `Origin` and
+  are allowed. This keeps other websites out; it is not authentication.
+- **Limits.** 64 KiB per frame (bigger closes the socket with 1009), the same
+  text limit as REST, 3 turns in flight per socket, 1 MiB of unsent output
+  before a slow client is dropped, and a 30 s ping that drops dead
+  connections. Closing a socket cancels its turns.
+
 ## Layout and dependency direction
 
 ```
@@ -240,7 +324,12 @@ src/
   main.ts                    composition root: the only place concrete classes are chosen
   config.ts                  env vars -> typed config, fail fast
   logger.ts                  structured logger (event name + fields)
-  http/server.ts             HTTP transport adapter (node:http)
+  http/
+    server.ts                HTTP transport adapter (node:http)
+    realtime.ts              WebSocket transport (/realtime): events out, messages in
+    input-rules.ts           client input limits shared by both transports
+  events/
+    conversation-events.ts   the in-process event bus and its event types
   runtime/
     agent-loop.ts            the agent loop, shared by every agent
     agent-runtime.ts         the conversation agent (history, turn lock, persistence)
@@ -253,10 +342,12 @@ src/
     simulated-coding-worker.ts  stand-in worker (no code is written)
     task-store.ts            async store interface + in-memory impl
     task-tools.ts            the five tools the agent uses to drive tasks
+    task-notifier.ts         announces finished tasks through platform-started turns
   tools/
     tool.ts                  Tool contract + ToolError
     tool-registry.ts         which tools exist; schema compilation
     tool-executor.ts         the trust boundary
+    tool-policy.ts           which tools a run may use (READ_ONLY for platform turns)
     get-current-time.ts      first native tool
   llm/
     llm-provider.ts          the provider boundary
@@ -274,14 +365,16 @@ src/
     task-checkout.ts         clone / commit / push, git dir outside the sandbox
     publish-task-tool.ts     publish_task
   core/                      provider-neutral messages, tool definitions, KeyedMutex
+scripts/chat.ts              terminal client for the realtime channel (no dependencies)
 ```
 
 ```
-http ──► runtime ──► LLMProvider (interface)      ◄── anthropic, stub
-              ├────► ToolExecutor ──► ToolRegistry ◄── native tools, task tools (later: MCP tools)
-              │                                          └─► TaskManager ──► TaskWorker, TaskStore
-              │                                                               └─ CodingWorker ─► runAgentLoop, Workspace, CommandSandbox, TaskCheckout
-              └────► ConversationStore (interface) ◄── in-memory
+http, realtime ──► runtime ──► LLMProvider (interface)      ◄── anthropic, stub
+                        ├────► ToolExecutor ──► ToolRegistry ◄── native tools, task tools (later: MCP tools)
+                        │                                          └─► TaskManager ──► TaskWorker, TaskStore
+                        │                                                               └─ CodingWorker ─► runAgentLoop, Workspace, CommandSandbox, TaskCheckout
+                        └────► ConversationStore (interface) ◄── in-memory
+runtime, TaskManager ──► ConversationEvents ◄── realtime, TaskNotifier (subscribers)
 everything ──► core/
 ```
 
@@ -293,12 +386,13 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
 
 | Event                 | Meaning                                                    |
 | --------------------- | ---------------------------------------------------------- |
-| `user.message`        | turn started                                               |
+| `user.message`        | turn started by the user                                   |
+| `platform.notice`     | turn started by the platform (a task finished)             |
 | `llm.request`         | runtime calls the provider (message count, offered tools)  |
 | `llm.request.payload` | debug only: the full request                               |
 | `llm.response`        | text, tool calls, stop reason, token usage, model, latency |
 | `tool.request`        | the model asked for a tool (untrusted input)               |
-| `tool.rejected`       | refused at the trust boundary (unknown tool, invalid input)|
+| `tool.rejected`       | refused at the trust boundary (`reason`: unknown tool, not permitted, invalid input) |
 | `tool.execution`      | passed all gates, now running                              |
 | `tool.result`         | outcome sent back to the model                             |
 | `tool.error`          | unexpected tool exception (details not shown to the model) |
@@ -318,6 +412,12 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
 | `git.cloned` / `git.committed` / `git.pushed` | repository checkout, per-attempt commit, publish (repository, branch, commit) |
 | `git.clone_failed` / `git.push_failed` | clone or push failed (details in the log, a short reason to the model) |
 | `http.rejected`       | 4xx: client input refused at the transport                 |
+| `realtime.connected` / `realtime.disconnected` | a WebSocket opened / closed (`connectionId`; turns cancelled by the close) |
+| `realtime.rejected`   | handshake refused (wrong path, `Origin` not allowed, bad conversationId) |
+| `realtime.invalid_message` | a client message was rejected (sent back as `error`)  |
+| `realtime.cancel_turn` | the client cancelled its turns                            |
+| `realtime.slow_client` | dropped: too much unsent output                           |
+| `events.listener_failed` | a subscriber threw; the publisher carried on            |
 | `http.error`          | 5xx: unexpected error (details only in logs)               |
 
 ## Design notes
@@ -339,11 +439,16 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
   instance. On SIGTERM, running tasks are recorded as interrupted first.
 - Task work runs inside the server process. At scale it moves to a queue and
   separate workers; `TaskManager` keeps its interface.
-- Task updates are pull-only (see Background tasks).
+- The event bus is in-process: a second instance wouldn't see the first's
+  events. Several instances need a shared bus or per-conversation routing.
+- A finished task costs one LLM call for its notice, whether or not anyone is
+  connected; the reply waits in the history.
 - Workspaces and checkouts are never cleaned up. Each task clones the whole
   base branch; submodules and Git LFS aren't supported.
 - The HTTP API has no authentication: keep it private (see DEPLOY.md).
-- Responses are not streamed (needed later for voice).
+  `ALLOWED_ORIGINS` protects the WebSocket from other websites, but REST
+  doesn't check the `Host` header, so a DNS-rebinding page in your browser
+  could still reach REST through the tunnel. Authentication closes both.
 - An in-process tool that ignores its abort signal keeps running after a
   timeout; the runtime just stops waiting. (Sandboxed commands don't have
   this problem: their container is removed.)

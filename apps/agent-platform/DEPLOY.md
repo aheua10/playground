@@ -100,11 +100,19 @@ aws ssm start-session --target <instance-id> \
   --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["3000"],"localPortNumber":["3000"]}'
 
-# in another terminal
+# in another terminal, from a checkout of this repository (Node.js >= 22.18, no npm install needed)
+cd apps/agent-platform && npm run chat -- demo
+
+# or plain REST
 curl -s -X POST localhost:3000/messages -H 'content-type: application/json' \
   -d '{"conversationId":"demo","message":"Create a TypeScript HTTP server with a /health route"}'
 curl -s localhost:3000/conversations/demo/tasks
 ```
+
+The tunnel carries the WebSocket (`/realtime`) as well as REST. Browser pages
+may connect only from the origins in `ALLOWED_ORIGINS` (by default
+`http://localhost:3000`), so keep the same local port on both ends of the
+tunnel, or add your local origin there.
 
 The tunnel ends at `localhost`, which browsers treat as a secure context. A
 later voice UI can therefore use the microphone through it without setting up

@@ -1,5 +1,5 @@
 {
-  // Type-checking config for src + test. `npm run typecheck` uses this.
+  // Type-checking config for src, test and scripts. `npm run typecheck` uses this.
   // The source is written so Node can run it directly via built-in type
   // stripping (`node src/main.ts`), which is why:
   //   - relative imports use `.ts` extensions (rewritten to `.js` on build)
@@ -18,5 +18,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "test"]
+  "include": ["src", "test", "scripts"]
 }
