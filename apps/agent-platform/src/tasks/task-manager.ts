@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { KeyedMutex } from "../core/keyed-mutex.ts";
+import type { ConversationEvents, TaskChange } from "../events/conversation-events.ts";
 import type { Logger } from "../logger.ts";
-import { canTransition, requirementsOf, type Task, type TaskStatus } from "./task.ts";
+import { canTransition, describeTask, requirementsOf, type Task, type TaskStatus } from "./task.ts";
 import type { TaskStore } from "./task-store.ts";
 import { TaskFailedError, type TaskWorker } from "./task-worker.ts";
 
@@ -20,6 +21,9 @@ import { TaskFailedError, type TaskWorker } from "./task-worker.ts";
 // Ownership is checked on every call: a task is only visible to the
 // conversation that started it.
 //
+// Every saved change is also published as a task.updated event, under the
+// task's lock, so subscribers see one task's changes in the order they happened.
+//
 // Running attempts live in this process (AbortControllers in #running). In a
 // multi-instance deployment this class keeps its interface but hands work to a
 // queue and separate workers; cancel becomes a message to the worker.
@@ -35,6 +39,7 @@ export interface TaskManagerDeps {
   store: TaskStore;
   worker: TaskWorker;
   logger: Logger;
+  events?: ConversationEvents;
   maxRunningPerConversation?: number;
 }
 
@@ -42,6 +47,7 @@ export class TaskManager {
   readonly #store: TaskStore;
   readonly #worker: TaskWorker;
   readonly #logger: Logger;
+  readonly #events: ConversationEvents | undefined;
   readonly #maxRunning: number;
   readonly #locks = new KeyedMutex();
   readonly #running = new Map<string, { attempt: number; controller: AbortController }>();
@@ -50,6 +56,7 @@ export class TaskManager {
     this.#store = deps.store;
     this.#worker = deps.worker;
     this.#logger = deps.logger;
+    this.#events = deps.events;
     this.#maxRunning = deps.maxRunningPerConversation ?? DEFAULT_MAX_RUNNING_PER_CONVERSATION;
   }
 
@@ -77,7 +84,7 @@ export class TaskManager {
       updatedAt: now,
     };
     return this.#locks.run(task.id, async () => {
-      await this.#store.save(task);
+      await this.#save(task, "started");
       this.#log(task).info("task.started", { instruction, repository: task.repository });
       this.#launch(task);
       return task;
@@ -97,7 +104,7 @@ export class TaskManager {
       task.progress = [];
       delete task.result;
       delete task.error;
-      await this.#save(task);
+      await this.#save(task, "revised");
       this.#log(task).info("task.revised", { change });
       this.#launch(task);
       return task;
@@ -110,7 +117,7 @@ export class TaskManager {
       if (task.status !== "running") throw new TaskError(`Task ${taskId} is already ${task.status}.`);
       this.#abortAttempt(taskId);
       this.#transition(task, "cancelled");
-      await this.#save(task);
+      await this.#save(task, "cancelled");
       this.#log(task).info("task.cancelled");
       return task;
     });
@@ -135,7 +142,7 @@ export class TaskManager {
           this.#abortAttempt(taskId);
           this.#transition(task, "failed");
           task.error = "Interrupted: the server shut down.";
-          await this.#save(task);
+          await this.#save(task, "failed");
           this.#log(task).warn("task.failed", { error: task.error });
         }),
       ),
@@ -162,7 +169,7 @@ export class TaskManager {
           {
             signal: controller.signal,
             reportProgress: (note) => {
-              void this.#applyIfCurrent(taskId, attempt, (current) => {
+              void this.#applyIfCurrent(taskId, attempt, "progress", (current) => {
                 current.progress.push(note);
                 log.info("task.progress", { note });
               });
@@ -172,13 +179,13 @@ export class TaskManager {
       )
       .then(
         (result) =>
-          this.#applyIfCurrent(taskId, attempt, (current) => {
+          this.#applyIfCurrent(taskId, attempt, "completed", (current) => {
             this.#transition(current, "completed");
             current.result = result;
             log.info("task.completed", { result });
           }),
         (error: unknown) =>
-          this.#applyIfCurrent(taskId, attempt, (current) => {
+          this.#applyIfCurrent(taskId, attempt, "failed", (current) => {
             this.#transition(current, "failed");
             current.error =
               error instanceof TaskFailedError ? error.message : "The task failed with an internal error.";
@@ -189,7 +196,12 @@ export class TaskManager {
 
   // Worker callbacks land here. If the attempt was cancelled or superseded in
   // the meantime, the update is dropped.
-  async #applyIfCurrent(taskId: string, attempt: number, change: (task: Task) => void): Promise<void> {
+  async #applyIfCurrent(
+    taskId: string,
+    attempt: number,
+    change: TaskChange,
+    apply: (task: Task) => void,
+  ): Promise<void> {
     try {
       await this.#locks.run(taskId, async () => {
         if (this.#running.get(taskId)?.attempt !== attempt) {
@@ -198,9 +210,9 @@ export class TaskManager {
         }
         const task = await this.#store.get(taskId);
         if (!task) return;
-        change(task);
+        apply(task);
         if (task.status !== "running") this.#running.delete(taskId);
-        await this.#save(task);
+        await this.#save(task, change);
       });
     } catch (error) {
       this.#logger.error("task.update_failed", { taskId, attempt, error });
@@ -228,9 +240,10 @@ export class TaskManager {
     return task;
   }
 
-  async #save(task: Task): Promise<void> {
+  async #save(task: Task, change: TaskChange): Promise<void> {
     task.updatedAt = new Date().toISOString();
     await this.#store.save(task);
+    this.#events?.publish({ type: "task.updated", conversationId: task.conversationId, change, task: describeTask(task) });
   }
 
   #log(task: Task): Logger {

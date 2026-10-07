@@ -42,7 +42,9 @@ export function requirementsOf(task: Task): string[] {
   return [task.instruction, ...task.revisions];
 }
 
-/** The view of a task shown to the model and to HTTP clients. */
+/** The view of a task shown to the model and to clients. */
+export type TaskView = ReturnType<typeof describeTask>;
+
 export function describeTask(task: Task) {
   return {
     taskId: task.id,
@@ -50,7 +52,7 @@ export function describeTask(task: Task) {
     repository: task.repository,
     attempt: task.attempt,
     requirements: requirementsOf(task),
-    progress: task.progress,
+    progress: [...task.progress],
     result: task.result,
     error: task.error,
     updatedAt: task.updatedAt,

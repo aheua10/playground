@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ConversationStore } from "../conversation/conversation-store.ts";
 import { KeyedMutex } from "../core/keyed-mutex.ts";
 import type { Message } from "../core/messages.ts";
+import type { ConversationEvent, ConversationEvents } from "../events/conversation-events.ts";
 import type { LLMProvider } from "../llm/llm-provider.ts";
 import type { Logger } from "../logger.ts";
 import type { ToolExecutor } from "../tools/tool-executor.ts";
@@ -38,6 +39,8 @@ export interface AgentRuntimeDeps {
   store: ConversationStore;
   toolExecutor: ToolExecutor;
   logger: Logger;
+  /** Where the turn's progress is published, for realtime clients. Optional: REST alone doesn't need it. */
+  events?: ConversationEvents;
   /** Upper bound on LLM calls per turn, so a looping model can't run forever. */
   maxSteps?: number;
 }
@@ -47,6 +50,7 @@ export class AgentRuntime {
   readonly #store: ConversationStore;
   readonly #toolExecutor: ToolExecutor;
   readonly #logger: Logger;
+  readonly #events: ConversationEvents | undefined;
   readonly #maxSteps: number;
   readonly #turnLocks = new KeyedMutex();
 
@@ -55,6 +59,7 @@ export class AgentRuntime {
     this.#store = deps.store;
     this.#toolExecutor = deps.toolExecutor;
     this.#logger = deps.logger;
+    this.#events = deps.events;
     this.#maxSteps = deps.maxSteps ?? DEFAULT_MAX_STEPS;
   }
 
@@ -73,8 +78,13 @@ export class AgentRuntime {
     // Other conversations are unaffected.
     if (this.#turnLocks.isLocked(conversationId)) log.info("turn.waiting");
 
-    try {
-      const reply = await this.#turnLocks.run(conversationId, async () => {
+    // Everything below runs under the lock, including the events that open and
+    // close the turn: subscribers see one turn's events at a time, never two
+    // interleaved.
+    return this.#turnLocks.run(conversationId, async () => {
+      const publish = (event: TurnEvent) => this.#events?.publish({ ...event, conversationId, turnId });
+      publish({ type: "turn.started", text: input.text });
+      try {
         const history = await this.#store.getMessages(conversationId);
         const result = await runAgentLoop({
           llm: this.#llm,
@@ -91,18 +101,20 @@ export class AgentRuntime {
         // Persisted only now, as a unit: a failed or cancelled turn leaves
         // history untouched.
         await this.#store.appendMessages(conversationId, result.messages);
-        return result.reply;
-      });
-      log.info("final.response", { reply, durationMs: elapsed(turnStartedAt) });
-      return { conversationId, turnId, reply };
-    } catch (error) {
-      if (signal.aborted) {
-        log.warn("turn.cancelled", { durationMs: elapsed(turnStartedAt) });
-      } else {
-        log.error("turn.failed", { error, durationMs: elapsed(turnStartedAt) });
+        log.info("final.response", { reply: result.reply, durationMs: elapsed(turnStartedAt) });
+        publish({ type: "turn.completed", reply: result.reply });
+        return { conversationId, turnId, reply: result.reply };
+      } catch (error) {
+        if (signal.aborted) {
+          log.warn("turn.cancelled", { durationMs: elapsed(turnStartedAt) });
+        } else {
+          log.error("turn.failed", { error, durationMs: elapsed(turnStartedAt) });
+        }
+        // The reason only: error details stay in the logs, not on the wire.
+        publish({ type: "turn.failed", reason: signal.aborted ? "cancelled" : "error" });
+        throw error;
       }
-      throw error;
-    }
+    });
   }
 
   /** Read-only view of a conversation, for inspection/debugging endpoints. */
@@ -110,6 +122,10 @@ export class AgentRuntime {
     return this.#store.getMessages(conversationId);
   }
 }
+
+/** A turn's events before the runtime stamps them with the conversation and turn ids. */
+type TurnEvent = DistributiveOmit<Extract<ConversationEvent, { turnId: string }>, "conversationId" | "turnId">;
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
 function elapsed(startedAt: number): number {
   return Math.round(performance.now() - startedAt);
