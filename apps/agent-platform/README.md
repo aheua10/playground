@@ -4,7 +4,7 @@ A learning project: an agent runtime built without an agent framework, so the
 agent loop, the tool trust boundary, and the provider abstraction are all
 visible in our own code.
 
-**Status: Phase 5 complete, plus authentication.**
+**Status: Phase 5 complete, plus authentication and persistence.**
 - **Phase 1:** conversations over HTTP, an explicit agent loop, a native tool
   (`get_current_time`) behind a trust boundary, and two LLM providers: a
   deterministic stub (default, no API key) and Anthropic (Claude).
@@ -19,8 +19,10 @@ visible in our own code.
   task finishes.
 - **Authentication:** bearer tokens per user, and conversations (with their
   tasks) private to their user.
+- **Persistence:** conversations and tasks live in a SQLite file, so they
+  survive restarts and crashes.
 
-Not yet: MCP, persistence, voice. Deploying: see
+Not yet: MCP, voice. Deploying: see
 [DEPLOY.md](DEPLOY.md).
 
 ## Run it
@@ -40,6 +42,9 @@ npm run typecheck
 
 Without `AUTH_TOKENS` the server refuses to start. On a machine only you can
 reach, `AUTH=none` in `.env` switches authentication off instead.
+Conversations and tasks are kept in `./data/agent-platform.db`
+(`STORE=memory` for a throwaway run). Node prints an `ExperimentalWarning`
+for SQLite at startup; see [Persistence](#persistence).
 
 Or with Docker (reads the same `.env`):
 
@@ -83,6 +88,8 @@ the coding worker it only writes a `NOTES.md` (and runs one command with
 | `ANTHROPIC_EFFORT`  | `medium`                       | `low` `medium` `high` `xhigh` `max`     |
 | `AUTH`              | `tokens`                       | `tokens` `none`                         |
 | `AUTH_TOKENS`       | (required for `tokens`)        | `name:sha256hex`, comma-separated, from `npm run create-token` |
+| `STORE`             | `sqlite`                       | `sqlite` `memory` (lost on restart)     |
+| `DATABASE_PATH`     | `./data/agent-platform.db`     | the SQLite file (`/data/agent-platform.db` in the image) |
 | `PORT`              | `3000`                         | 1-65535                                 |
 | `LOG_LEVEL`         | `info`                         | `debug` `info` `warn` `error`           |
 | `LOG_FORMAT`        | `pretty` on a TTY, else `json` | `pretty` `json`                         |
@@ -381,6 +388,39 @@ REST, sockets, notices: every turn publishes the same events
   before a slow client is dropped, and a 30 s ping that drops dead
   connections. Closing a socket cancels its turns.
 
+## Persistence
+
+```
+SQLite file (DATABASE_PATH)            ◄── SqliteConversationStore, SqliteTaskStore
+  messages  one row per message, JSON       (ConversationStore / TaskStore interfaces)
+  tasks     the Task as JSON + lookup columns
+WORKSPACES_DIR                         ◄── task files and git directories (as before)
+in memory only                             live events, turn locks, running attempts
+```
+
+- **Why SQLite.** One instance, so the store can be a library rather than a
+  server: no extra container, port or password, the whole state is one file,
+  and Node ships it (`node:sqlite`), so it's not even a dependency. Node
+  still marks it experimental and prints a warning at startup. Postgres
+  would be one more implementation of the same two store interfaces, for
+  when several instances must share state.
+- **Messages are stored exactly as produced**, as JSON, including the
+  provider's `raw` data: Anthropic's signed thinking blocks are replayed byte
+  for byte after a restart. A turn's messages go in one transaction, so a
+  turn is still all or nothing.
+- **A crash can't leave a task "running" forever.** At startup, before
+  accepting requests, tasks still marked running are failed as interrupted
+  (`task.failed`, `recovered=true`; published as `interrupted`, so no notice
+  turn). A clean shutdown records them itself. Revising one starts a new
+  attempt on the same workspace.
+- **Schema changes are numbered migrations** in `persistence/database.ts`,
+  applied at startup and recorded in SQLite's `user_version`. A database
+  written by newer code is refused rather than risked.
+- **Durability and privacy.** WAL mode: a crash or power loss can lose the
+  last commits, but never corrupts the file. The file is created `0600` in a
+  `0700` directory, since conversations hold whatever users and models wrote.
+  To back it up, copy it while the agent is stopped.
+
 ## Layout and dependency direction
 
 ```
@@ -408,9 +448,13 @@ src/
     task-worker.ts           TaskWorker contract
     coding-worker.ts         the worker agent: agent loop + workspace tools + sandbox
     simulated-coding-worker.ts  stand-in worker (no code is written)
-    task-store.ts            async store interface + in-memory impl
+    task-store.ts            TaskStore interface + in-memory impl
     task-tools.ts            the five tools the agent uses to drive tasks
     task-notifier.ts         announces finished tasks through platform-started turns
+  persistence/
+    database.ts              opens the SQLite file: pragmas, permissions, migrations
+    sqlite-conversation-store.ts  ConversationStore on SQLite
+    sqlite-task-store.ts     TaskStore on SQLite
   tools/
     tool.ts                  Tool contract + ToolError
     tool-registry.ts         which tools exist; schema compilation
@@ -421,7 +465,7 @@ src/
     llm-provider.ts          the provider boundary
     anthropic-provider.ts    Claude via the Anthropic SDK (the only file that knows its format)
     stub-llm-provider.ts     deterministic fake that speaks tool calls
-  conversation/              async, append-only store interface + in-memory impl
+  conversation/              ConversationStore interface (async, append-only) + in-memory impl
   sandbox/
     workspace.ts             the filesystem boundary
     workspace-tools.ts       list/read/write/delete_file
@@ -441,9 +485,9 @@ scripts/
 ```
 http, realtime ──► runtime ──► LLMProvider (interface)      ◄── anthropic, stub
                         ├────► ToolExecutor ──► ToolRegistry ◄── native tools, task tools (later: MCP tools)
-                        │                                          └─► TaskManager ──► TaskWorker, TaskStore
+                        │                                          └─► TaskManager ──► TaskWorker, TaskStore ◄── sqlite, in-memory
                         │                                                               └─ CodingWorker ─► runAgentLoop, Workspace, CommandSandbox, TaskCheckout
-                        └────► ConversationStore (interface) ◄── in-memory
+                        └────► ConversationStore (interface) ◄── sqlite, in-memory
 runtime, TaskManager ──► ConversationEvents ◄── realtime, TaskNotifier (subscribers)
 everything ──► core/
 ```
@@ -474,7 +518,7 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
 | `task.progress`       | worker progress note                                       |
 | `task.revised`        | requirement added; new attempt launched                    |
 | `task.completed`      | worker finished; result stored                             |
-| `task.failed`         | worker failed, or interrupted by shutdown                  |
+| `task.failed`         | worker failed, interrupted by shutdown, or found interrupted at startup (`recovered=true`) |
 | `task.cancelled`      | stopped on request                                         |
 | `task.stale_update_dropped` | debug: late result from a superseded attempt ignored |
 | `worker.started`      | a coding worker attempt began (workspace path); its own `llm.*`/`tool.*` lines carry `taskId`, `attempt`, `agent=coding-worker` |
@@ -501,17 +545,17 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
   tool list is sorted, and history is append-only. That keeps prompt caching
   effective and satisfies Anthropic's check that the history before a
   thinking block is unchanged. Dynamic facts like the time come from tools.
-- **Turns are all-or-nothing.** A failed or cancelled turn persists nothing.
+- **Turns are all-or-nothing.** A failed or cancelled turn persists nothing,
+  and a completed one is stored in a single transaction.
   Tool side effects are not rolled back, so the `tool.*` logs are the audit trail.
 
 ## Known limitations (intentional for now)
 
-- Conversations and tasks are in memory: lost on restart, so run a single
-  instance. On SIGTERM, running tasks are recorded as interrupted first.
-- Task work runs inside the server process. At scale it moves to a queue and
-  separate workers; `TaskManager` keeps its interface.
-- The event bus is in-process: a second instance wouldn't see the first's
-  events. Several instances need a shared bus or per-conversation routing.
+- One instance only. The database is a local file, and the event bus, turn
+  locks and running attempts are in-process. Several instances need Postgres
+  (the same two store interfaces), a shared bus, and work handed to a queue.
+- A task that was running when the server stopped is not resumed: it is
+  recorded as interrupted, and revising it starts a new attempt.
 - A finished task costs one LLM call for its notice, whether or not anyone is
   connected; the reply waits in the history.
 - Workspaces and checkouts are never cleaned up. Each task clones the whole

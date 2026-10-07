@@ -137,13 +137,18 @@ TLS first.
 - **Logs:** `sudo docker compose ... logs -f`. These are JSON lines; sending
   them to CloudWatch is a later step (the `awslogs` driver).
 - **Update:** `sudo git pull`, then the same `up -d --build`.
-- **Restarts:** conversations and tasks are in memory and lost on restart;
-  workspaces persist.
+- **Restarts:** conversations and tasks persist in the `data` volume (a
+  SQLite file), and workspaces in `/srv/agent-workspaces`. A task that was
+  running when the agent stopped is recorded as interrupted; ask the agent to
+  revise it to try again.
+- **Backups:** `sudo docker compose ... stop`, then
+  `sudo docker compose ... cp agent-platform:/data/agent-platform.db ./backup.db`
+  (a stopped container can still be copied from), and back up
+  `/srv/agent-workspaces` alongside it. Then `up -d` again.
 - **Cost:** stop the instance when you're not using it.
 
 ## Before exposing it beyond the tunnel
 
 Do these first: HTTPS (an ALB with an ACM certificate, or a reverse proxy),
-token expiry or a real sign-in, and persistent conversation and task
-storage. Then add the name clients will use to `ALLOWED_HOSTS` (and, for a
+and token expiry or a real sign-in. Then add the name clients will use to `ALLOWED_HOSTS` (and, for a
 browser UI, its origin to `ALLOWED_ORIGINS`): any other name is refused.
