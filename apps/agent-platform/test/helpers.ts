@@ -1,6 +1,7 @@
 import type { ToolCall } from "../src/core/messages.ts";
 import type { LLMProvider, LLMRequest, LLMResponse } from "../src/llm/llm-provider.ts";
 import { createLogger, type LogFields } from "../src/logger.ts";
+import type { TaskWorker, TaskWorkerContext, TaskWorkerInput } from "../src/tasks/task-worker.ts";
 
 /** Plays back pre-scripted responses and records every request it receives. */
 export class ScriptedLLMProvider implements LLMProvider {
@@ -53,5 +54,32 @@ export async function eventually(check: () => boolean | Promise<boolean>, timeou
   while (!(await check())) {
     if (Date.now() > deadline) throw new Error("Condition not met in time");
     await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+type ControlledRun = {
+  input: TaskWorkerInput;
+  context: TaskWorkerContext;
+  resolve: (result: string) => void;
+  reject: (error: unknown) => void;
+};
+
+/** A TaskWorker whose attempts the test finishes by hand. */
+export class ControlledWorker implements TaskWorker {
+  readonly runs: ControlledRun[] = [];
+  readonly #honourAbort: boolean;
+
+  /** honourAbort: false simulates a worker that ignores cancellation and finishes anyway. */
+  constructor(options: { honourAbort?: boolean } = {}) {
+    this.#honourAbort = options.honourAbort ?? true;
+  }
+
+  run(input: TaskWorkerInput, context: TaskWorkerContext): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (this.#honourAbort) {
+        context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true });
+      }
+      this.runs.push({ input, context, resolve, reject });
+    });
   }
 }
