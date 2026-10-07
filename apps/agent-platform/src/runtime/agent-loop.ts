@@ -1,7 +1,8 @@
-import type { Message, ToolCall, ToolResultMessage, UserMessage } from "../core/messages.ts";
+import type { Message, NoticeMessage, ToolCall, ToolResultMessage, UserMessage } from "../core/messages.ts";
 import type { LLMProvider, StopReason } from "../llm/llm-provider.ts";
 import type { Logger } from "../logger.ts";
 import type { ToolExecutor } from "../tools/tool-executor.ts";
+import type { ToolPolicy } from "../tools/tool-policy.ts";
 
 // The agent loop, shared by every agent in the system. The conversation agent
 // (AgentRuntime) and the coding worker run this same loop; they differ only in
@@ -35,8 +36,8 @@ export interface AgentLoopInput {
   toolExecutor: ToolExecutor;
   /** Earlier messages, sent as context. Not modified. */
   history: Message[];
-  /** The message that starts this run. */
-  userMessage: UserMessage;
+  /** The message that starts this run: the user's, or a platform notice. */
+  firstMessage: UserMessage | NoticeMessage;
   maxSteps: number;
   signal: AbortSignal;
   log: Logger;
@@ -44,12 +45,14 @@ export interface AgentLoopInput {
   conversationId: string;
   /** Identifies this run: a conversation turn, or a task attempt. */
   turnId: string;
+  /** Limits which tools may run. Omitted: all of the executor's tools. */
+  toolPolicy?: ToolPolicy;
   observer?: AgentLoopObserver;
 }
 
 export interface AgentLoopResult {
   reply: string;
-  /** The user message followed by everything this run produced, in order. */
+  /** The first message followed by everything this run produced, in order. */
   messages: Message[];
 }
 
@@ -59,7 +62,7 @@ export class StepLimitExceededError extends Error {
 
 export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResult> {
   const { llm, systemPrompt, toolExecutor, maxSteps, signal, log, observer } = input;
-  const messages: Message[] = [input.userMessage];
+  const messages: Message[] = [input.firstMessage];
 
   for (let step = 1; step <= maxSteps; step++) {
     signal.throwIfAborted(); // cancelled between steps: don't start another LLM call
@@ -113,6 +116,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
         turnId: input.turnId,
         signal,
         log: stepLog,
+        policy: input.toolPolicy,
       });
       observer?.onToolResult?.(result);
       messages.push(result);

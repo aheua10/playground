@@ -11,6 +11,7 @@ type GetCurrentTimeInput = { timeZone?: string };
 /** `now` is injectable so tests are deterministic. */
 export function createGetCurrentTimeTool(now: () => Date = () => new Date()): Tool<GetCurrentTimeInput> {
   return {
+    readOnly: true,
     definition: {
       name: "get_current_time",
       description:

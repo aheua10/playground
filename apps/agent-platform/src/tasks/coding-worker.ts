@@ -81,7 +81,7 @@ export class CodingWorker implements TaskWorker {
         systemPrompt: this.#systemPrompt,
         toolExecutor: new ToolExecutor({ registry, timeoutMs: TOOL_TIMEOUT_MS }),
         history: [],
-        userMessage: { role: "user", content: await taskBrief(input, checkout) },
+        firstMessage: { role: "user", content: await taskBrief(input, checkout) },
         maxSteps: this.#maxSteps,
         signal,
         log,

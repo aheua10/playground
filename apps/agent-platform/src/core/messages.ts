@@ -9,6 +9,16 @@ export type UserMessage = {
   content: string;
 };
 
+/**
+ * A message from the platform rather than the user, e.g. "task X completed".
+ * It starts a turn nobody asked for; providers present it to the model as
+ * clearly marked platform input, not as something the user said.
+ */
+export type NoticeMessage = {
+  role: "notice";
+  content: string;
+};
+
 /** A request from the model to run one of our tools. The model proposes; the runtime decides. */
 export type ToolCall = {
   /** Provider-assigned id. The matching ToolResultMessage must echo it. */
@@ -36,7 +46,7 @@ export type ToolResultMessage = {
   isError: boolean;
 };
 
-export type Message = UserMessage | AssistantMessage | ToolResultMessage;
+export type Message = UserMessage | NoticeMessage | AssistantMessage | ToolResultMessage;
 
 // Why `raw` exists: provider neutrality has a limit. Some providers return
 // opaque state that must be sent back unchanged on later requests. Anthropic's

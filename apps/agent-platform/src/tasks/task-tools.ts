@@ -64,6 +64,7 @@ export function createTaskTools(tasks: TaskManager, options: TaskToolOptions = {
   };
 
   const getTask: Tool<{ taskId: string }> = {
+    readOnly: true,
     definition: {
       name: "get_task",
       description:
@@ -80,6 +81,7 @@ export function createTaskTools(tasks: TaskManager, options: TaskToolOptions = {
   };
 
   const listTasks: Tool<Record<string, never>> = {
+    readOnly: true,
     definition: {
       name: "list_tasks",
       description:

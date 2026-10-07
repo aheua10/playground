@@ -212,3 +212,16 @@ test("toAnthropicMessages: rebuilds assistant turns that came from another provi
     ],
   });
 });
+
+test("toAnthropicMessages: a platform notice is user input, tagged as coming from the platform", () => {
+  const history: Message[] = [
+    { role: "user", content: "Build it" },
+    { role: "assistant", content: "Started.", toolCalls: [] },
+    { role: "notice", content: "Task task_1 has completed." },
+  ];
+
+  assert.deepEqual(toAnthropicMessages(history)[2], {
+    role: "user",
+    content: [{ type: "text", text: "<platform_notice>\nTask task_1 has completed.\n</platform_notice>" }],
+  });
+});

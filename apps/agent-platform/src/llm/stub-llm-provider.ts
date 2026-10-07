@@ -8,7 +8,8 @@ import type { LLMProvider, LLMRequest, LLMResponse } from "./llm-provider.ts";
 // agent loop and task lifecycle can be exercised without an API key.
 //
 // As the conversation agent: if the last message is a tool result, it replies
-// by quoting that result. Otherwise the first matching rule below picks a tool
+// by quoting that result; if it is a platform notice, it passes on the notice's
+// first line. Otherwise the first matching rule below picks a tool
 // call (only tools that are actually offered count); "the task" means the most
 // recent taskId seen in the conversation, and "this project" means the first
 // repository start_coding_task offers. With no match it echoes the message.
@@ -101,6 +102,9 @@ export class StubLLMProvider implements LLMProvider {
       const outcome = last.isError ? "failed" : "returned";
       return reply(`[stub] ${last.toolName} ${outcome}: ${last.content}`);
     }
+    if (last?.role === "notice") {
+      return reply(`[stub] Heads-up: ${last.content.split("\n")[0]}`);
+    }
 
     const text = request.messages.findLast((m) => m.role === "user")?.content ?? "";
     const latestTaskId = findLatestTaskId(request.messages);
@@ -145,7 +149,7 @@ function reply(content: string): LLMResponse {
 
 function findLatestTaskId(messages: Message[]): string | undefined {
   const ids = messages
-    .filter((m) => m.role === "tool")
+    .filter((m) => m.role === "tool" || m.role === "notice")
     .flatMap((m) => [...m.content.matchAll(/"taskId":"(task_[a-z0-9]+)"/g)].map((match) => match[1]!));
   return ids.at(-1);
 }

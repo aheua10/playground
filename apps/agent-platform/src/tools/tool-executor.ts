@@ -2,6 +2,7 @@ import type { ToolCall, ToolResultMessage } from "../core/messages.ts";
 import type { ToolDefinition } from "../core/tool-definition.ts";
 import type { Logger } from "../logger.ts";
 import { ToolError } from "./tool.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 import type { ToolRegistry } from "./tool-registry.ts";
 
 // THE TRUST BOUNDARY.
@@ -10,10 +11,9 @@ import type { ToolRegistry } from "./tool-registry.ts";
 // runs unless it passes these gates, in order:
 //
 //   1. exists      only registered tools can run; the model can't invent capabilities
-//   2. permitted   policy check. None yet: the only side effects so far are task
-//                  start/revise/cancel, which TaskManager scopes to the calling
-//                  conversation. Permissions, approvals and filesystem/command
-//                  limits plug in here once tools can touch files or run commands.
+//   2. permitted   the run's ToolPolicy, if it has one (tool-policy.ts). Today:
+//                  platform-started turns may only use read-only tools. Per-user
+//                  permissions and approvals plug in here.
 //   3. valid       input must match the tool's JSON Schema
 //   4. bounded     runs with a timeout and the turn's cancellation signal
 //
@@ -31,6 +31,8 @@ export interface ToolExecutionContext {
   turnId: string;
   signal: AbortSignal;
   log: Logger;
+  /** Omitted: every registered tool is permitted. */
+  policy?: ToolPolicy;
 }
 
 export class ToolExecutor {
@@ -67,7 +69,12 @@ export class ToolExecutor {
     const registered = this.#registry.get(call.name);
     if (!registered) return reject("unknown_tool", `Unknown tool "${call.name}".`);
 
-    // 2. permitted: no policy yet (see header comment).
+    // 2. permitted
+    const { policy } = context;
+    if (policy && !policy.permits(registered.tool)) {
+      log.warn("tool.rejected", { reason: "not_permitted", policy: policy.name });
+      return result(`Tool "${call.name}" is not permitted here. ${policy.refusal}`, true);
+    }
 
     // 3. valid
     const validationError = registered.validateInput(call.input);

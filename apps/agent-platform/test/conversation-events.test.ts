@@ -43,10 +43,10 @@ test("delivers a conversation's events to its subscribers and everything to subs
   const all: ConversationEvent[] = [];
   const stopAll = events.subscribeAll((event) => all.push(event));
 
-  events.publish({ type: "turn.started", conversationId: "a", turnId: "t1", text: "hi" });
-  events.publish({ type: "turn.started", conversationId: "b", turnId: "t2", text: "hello" });
+  events.publish({ type: "turn.started", conversationId: "a", turnId: "t1", initiator: "user", text: "hi" });
+  events.publish({ type: "turn.started", conversationId: "b", turnId: "t2", initiator: "user", text: "hello" });
   stopAll();
-  events.publish({ type: "turn.started", conversationId: "a", turnId: "t3", text: "again" });
+  events.publish({ type: "turn.started", conversationId: "a", turnId: "t3", initiator: "user", text: "again" });
 
   assert.deepEqual(a.map((e) => e.type === "turn.started" && e.turnId), ["t1", "t3"]);
   assert.deepEqual(all.map((e) => e.conversationId), ["a", "b"]);
@@ -60,7 +60,7 @@ test("a failing subscriber is logged and doesn't stop the others", () => {
   });
   const seen = record(events, "a");
 
-  events.publish({ type: "turn.started", conversationId: "a", turnId: "t1", text: "hi" });
+  events.publish({ type: "turn.started", conversationId: "a", turnId: "t1", initiator: "user", text: "hi" });
 
   assert.equal(seen.length, 1);
   assert.equal(lines.at(-1)?.event, "events.listener_failed");
@@ -74,7 +74,7 @@ test("unsubscribing the last listener forgets the conversation", () => {
   stop();
   stop(); // idempotent
 
-  events.publish({ type: "turn.started", conversationId: "a", turnId: "t1", text: "hi" });
+  events.publish({ type: "turn.started", conversationId: "a", turnId: "t1", initiator: "user", text: "hi" });
 
   assert.equal(seen.length, 0);
 });
@@ -86,7 +86,7 @@ test("a turn publishes started, its reply as it streams, then completed", async 
   const result = await runtime.runTurn({ conversationId: "c1", text: "hello there" });
 
   const { turnId } = result;
-  assert.deepEqual(seen.at(0), { type: "turn.started", conversationId: "c1", turnId, text: "hello there" });
+  assert.deepEqual(seen.at(0), { type: "turn.started", conversationId: "c1", turnId, initiator: "user", text: "hello there" });
   assert.deepEqual(seen.at(-1), { type: "turn.completed", conversationId: "c1", turnId, reply: result.reply });
   const deltas = seen.slice(1, -1);
   assert.ok(deltas.length > 1, "streamed in pieces");
@@ -204,10 +204,7 @@ test("cancellation, failure and shutdown are published too", async () => {
     >;
   assert.equal(last(cancelled.id).change, "cancelled");
   assert.deepEqual([last(failed.id).change, last(failed.id).task.error], ["failed", "tests failed"]);
-  assert.deepEqual([last(interrupted.id).change, last(interrupted.id).task.error], [
-    "failed",
-    "Interrupted: the server shut down.",
-  ]);
+  assert.deepEqual([last(interrupted.id).change, last(interrupted.id).task.status], ["interrupted", "failed"]);
 });
 
 test("a published task is a snapshot, not a live view", async () => {

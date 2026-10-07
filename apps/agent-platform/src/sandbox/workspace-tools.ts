@@ -14,6 +14,7 @@ const PATH = {
 
 export function createWorkspaceTools(workspace: Workspace, reportProgress: (note: string) => void): Tool<never>[] {
   const listFiles: Tool<Record<string, never>> = {
+    readOnly: true,
     definition: {
       name: "list_files",
       description:
@@ -25,6 +26,7 @@ export function createWorkspaceTools(workspace: Workspace, reportProgress: (note
   };
 
   const readFile: Tool<{ path: string }> = {
+    readOnly: true,
     definition: {
       name: "read_file",
       description: "Returns the content of a text file in the workspace.",

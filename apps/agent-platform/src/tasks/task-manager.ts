@@ -142,7 +142,7 @@ export class TaskManager {
           this.#abortAttempt(taskId);
           this.#transition(task, "failed");
           task.error = "Interrupted: the server shut down.";
-          await this.#save(task, "failed");
+          await this.#save(task, "interrupted");
           this.#log(task).warn("task.failed", { error: task.error });
         }),
       ),

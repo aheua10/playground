@@ -20,6 +20,8 @@ export interface ToolContext {
  */
 export interface Tool<Input = unknown> {
   definition: ToolDefinition;
+  /** Only reads: no side effects of any kind. Turns the platform starts may use only these. */
+  readOnly?: boolean;
   execute(input: Input, context: ToolContext): Promise<unknown>;
 }
 

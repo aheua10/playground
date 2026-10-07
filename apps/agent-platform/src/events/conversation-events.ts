@@ -10,10 +10,18 @@ import type { TaskView } from "../tasks/task.ts";
 // In-process only. Several instances would need a shared bus (e.g. Redis
 // pub/sub), or routing each conversation to a single instance.
 
-export type TaskChange = "started" | "progress" | "revised" | "completed" | "failed" | "cancelled";
+export type TaskChange =
+  | "started"
+  | "progress"
+  | "revised"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  /** Failed because the server shut down mid-task. */
+  | "interrupted";
 
 export type ConversationEvent =
-  | { type: "turn.started"; conversationId: string; turnId: string; text: string }
+  | { type: "turn.started"; conversationId: string; turnId: string; initiator: "user" | "platform"; text: string }
   | { type: "reply.delta"; conversationId: string; turnId: string; text: string }
   | { type: "tool.called"; conversationId: string; turnId: string; toolCallId: string; name: string; input: unknown }
   | { type: "tool.finished"; conversationId: string; turnId: string; toolCallId: string; name: string; isError: boolean }

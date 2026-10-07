@@ -104,6 +104,11 @@ export function toAnthropicMessages(messages: Message[]): Anthropic.Beta.BetaMes
       case "user":
         appendUserBlocks([{ type: "text", text: message.content }]);
         break;
+      // Anthropic has no platform role either. A notice travels as user input,
+      // tagged so the model can tell it from what the user said.
+      case "notice":
+        appendUserBlocks([{ type: "text", text: `<platform_notice>\n${message.content}\n</platform_notice>` }]);
+        break;
       case "tool":
         appendUserBlocks([
           {

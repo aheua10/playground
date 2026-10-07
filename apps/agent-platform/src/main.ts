@@ -1,5 +1,6 @@
 import { loadConfig, type LLMConfig, type TaskWorkerConfig } from "./config.ts";
 import { InMemoryConversationStore } from "./conversation/in-memory-conversation-store.ts";
+import { ConversationEvents } from "./events/conversation-events.ts";
 import { createHttpServer } from "./http/server.ts";
 import { AnthropicProvider } from "./llm/anthropic-provider.ts";
 import type { LLMProvider } from "./llm/llm-provider.ts";
@@ -14,6 +15,7 @@ import { DockerCommandSandbox } from "./sandbox/docker-command-sandbox.ts";
 import { CodingWorker } from "./tasks/coding-worker.ts";
 import { SimulatedCodingWorker } from "./tasks/simulated-coding-worker.ts";
 import { TaskManager } from "./tasks/task-manager.ts";
+import { startTaskNotifier } from "./tasks/task-notifier.ts";
 import { InMemoryTaskStore } from "./tasks/task-store.ts";
 import { createTaskTools } from "./tasks/task-tools.ts";
 import type { TaskWorker } from "./tasks/task-worker.ts";
@@ -34,7 +36,8 @@ const repositories = new RepositoryCatalog(config.worker.kind === "coding" ? con
 // handed only to the code that uses it; it is not part of the config object.
 const gitAuth = tokenAuth(process.env.GIT_TOKEN);
 const worker = await createTaskWorker(config.worker, llm, logger);
-const tasks = new TaskManager({ store: new InMemoryTaskStore(), worker, logger });
+const events = new ConversationEvents(logger);
+const tasks = new TaskManager({ store: new InMemoryTaskStore(), worker, logger, events });
 
 const toolRegistry = new ToolRegistry();
 toolRegistry.register(createGetCurrentTimeTool());
@@ -46,7 +49,8 @@ if (config.worker.kind === "coding" && config.worker.allowGitPush) {
 
 const store = new InMemoryConversationStore();
 const toolExecutor = new ToolExecutor({ registry: toolRegistry });
-const runtime = new AgentRuntime({ llm, store, toolExecutor, logger });
+const runtime = new AgentRuntime({ llm, store, toolExecutor, logger, events });
+startTaskNotifier({ events, runtime });
 const server = createHttpServer({ runtime, tasks, logger });
 
 server.listen(config.port, () => {

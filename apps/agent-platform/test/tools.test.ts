@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ToolCall } from "../src/core/messages.ts";
+import { createPublishTaskTool } from "../src/repositories/publish-task-tool.ts";
+import { createRunCommandTool } from "../src/sandbox/command-sandbox.ts";
+import { createWorkspaceTools } from "../src/sandbox/workspace-tools.ts";
+import { createTaskTools } from "../src/tasks/task-tools.ts";
 import { createGetCurrentTimeTool } from "../src/tools/get-current-time.ts";
 import { ToolError, type Tool } from "../src/tools/tool.ts";
 import { ToolExecutor } from "../src/tools/tool-executor.ts";
+import { READ_ONLY, type ToolPolicy } from "../src/tools/tool-policy.ts";
 import { ToolRegistry } from "../src/tools/tool-registry.ts";
 import { captureLogger, FIXED_NOW } from "./helpers.ts";
 
@@ -16,9 +21,9 @@ function setup(tools: Tool<never>[], timeoutMs?: number) {
   tools.forEach((tool) => registry.register(tool));
   const { logger, events } = captureLogger();
   const executor = new ToolExecutor({ registry, timeoutMs });
-  const run = (call: Partial<ToolCall> & { name: string }, signal = new AbortController().signal) =>
-    executor.execute({ id: "call_1", input: {}, ...call }, { conversationId: "c", turnId: "t", signal, log: logger });
-  return { run, events };
+  const run = (call: Partial<ToolCall> & { name: string }, signal = new AbortController().signal, policy?: ToolPolicy) =>
+    executor.execute({ id: "call_1", input: {}, ...call }, { conversationId: "c", turnId: "t", signal, log: logger, policy });
+  return { run, events, executor };
 }
 
 test("registry: rejects duplicate names and broken schemas at registration time", () => {
@@ -62,6 +67,28 @@ test("executor: rejects input that does not match the schema", async () => {
   }
 });
 
+test("executor: a policy decides which tools may run, whatever the model was offered", async () => {
+  let wrote = false;
+  const write = fakeTool("write_thing", async () => {
+    wrote = true;
+    return "written";
+  });
+  const read: Tool = { ...fakeTool("read_thing", async () => "read"), readOnly: true };
+  const { run, events, executor } = setup([write, read]);
+  const signal = new AbortController().signal;
+
+  // Both are offered, so the request to the model is the same under any policy.
+  assert.deepEqual(executor.definitions().map((d) => d.name), ["read_thing", "write_thing"]);
+  const refused = await run({ name: "write_thing" }, signal, READ_ONLY);
+  const allowed = await run({ name: "read_thing" }, signal, READ_ONLY);
+
+  assert.equal(wrote, false);
+  assert.equal(refused.isError, true);
+  assert.match(refused.content, /Tool "write_thing" is not permitted here\. This turn was started by the platform/);
+  assert.deepEqual([allowed.isError, allowed.content], [false, "read"]);
+  assert.deepEqual(events().slice(0, 2), ["tool.request", "tool.rejected"]);
+});
+
 test("executor: ToolError messages reach the model, other errors do not", async () => {
   const { run } = setup([
     fakeTool("expected", async () => {
@@ -103,4 +130,19 @@ test("get_current_time: defaults to UTC and rejects unknown zones", async () => 
     local: "Wednesday, October 7, 2026 at 12:00:00 PM UTC",
   });
   await assert.rejects(tool.execute({ timeZone: "Mars/Olympus" }, context), ToolError);
+});
+
+test("read-only tools are exactly the ones without side effects", () => {
+  // Factories only build definitions here; nothing is executed.
+  const unused = {} as never;
+  const tools = [
+    createGetCurrentTimeTool(),
+    ...createTaskTools(unused),
+    createPublishTaskTool(unused),
+    ...createWorkspaceTools(unused, () => {}),
+    createRunCommandTool(unused, unused, () => {}),
+  ];
+
+  const readOnly = tools.filter((tool) => tool.readOnly).map((tool) => tool.definition.name);
+  assert.deepEqual(readOnly.sort(), ["get_current_time", "get_task", "list_files", "list_tasks", "read_file"]);
 });
