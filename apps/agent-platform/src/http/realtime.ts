@@ -56,7 +56,9 @@ export function attachRealtime(server: Server, deps: RealtimeDeps): Realtime {
   const alive = new WeakSet<WebSocket>();
 
   server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-    socket.on("error", () => socket.destroy());
+    // Until ws takes over the socket, errors on it (a client resetting mid-handshake) are ours.
+    const onSocketError = () => socket.destroy();
+    socket.on("error", onSocketError);
     const url = new URL(req.url ?? "/", "http://localhost");
     const conversationId = url.searchParams.get("conversationId") ?? "";
     const origin = req.headers.origin;
@@ -73,6 +75,7 @@ export function attachRealtime(server: Server, deps: RealtimeDeps): Realtime {
     }
 
     wss.handleUpgrade(req, socket, head, (ws) => {
+      socket.removeListener("error", onSocketError);
       alive.add(ws);
       ws.on("pong", () => alive.add(ws));
       serve(ws, conversationId, deps);

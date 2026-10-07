@@ -295,15 +295,20 @@ REST, sockets, notices: every turn publishes the same events
 - **Streaming crosses the provider boundary as an observer.**
   `LLMRequest.onTextDelta` receives reply text as it is generated; the
   returned response stays authoritative. The Anthropic provider always
-  streams (`client.beta.messages.stream`). Tool-call arguments aren't
-  forwarded: they are acted on only once complete. The loop's
-  `AgentLoopObserver` adds tool calls and results; it can't change anything.
+  streams (`client.beta.messages.stream`). Partial tool-call arguments aren't
+  streamed: a call is reported (`tool.called`) once it is complete, which is
+  also when it runs. The loop's `AgentLoopObserver` reports tool calls and
+  results; it can't change anything.
 - **The platform can start a turn.** When a task completes or fails,
   `TaskNotifier` calls `runtime.notify()`. That turn starts with a `notice`
   message (sent to Claude as user input wrapped in `<platform_notice>`), and
   runs under the `READ_ONLY` tool policy: nobody asked for it, so the model may
-  look things up but not start, revise, cancel or publish anything. That also
-  means a notice can't cause another notice. The model is still offered every
+  look things up but not start, revise, cancel or publish anything. This
+  matters beyond etiquette: a notice carries the task's result, text written
+  by the worker model, which repository content may have steered. Whatever it
+  says, the turn can't act on it, and it can't close its `<platform_notice>`
+  tag early to pose as the user. It also means a notice can't cause another
+  notice. The model is still offered every
   tool, so the request prefix and its prompt cache stay the same; a refused
   call becomes an error result (`tool.rejected`, `reason=not_permitted`).
   Notices queue behind the user's turn, like any other turn.

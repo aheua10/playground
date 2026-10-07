@@ -105,10 +105,14 @@ export function toAnthropicMessages(messages: Message[]): Anthropic.Beta.BetaMes
         appendUserBlocks([{ type: "text", text: message.content }]);
         break;
       // Anthropic has no platform role either. A notice travels as user input,
-      // tagged so the model can tell it from what the user said.
-      case "notice":
-        appendUserBlocks([{ type: "text", text: `<platform_notice>\n${message.content}\n</platform_notice>` }]);
+      // tagged so the model can tell it from what the user said. Its content
+      // can include text a worker model wrote, so it must not be able to close
+      // the tag early and continue as if the user were speaking.
+      case "notice": {
+        const content = message.content.replace(/<\s*\/\s*platform_notice\s*>/gi, "&lt;/platform_notice&gt;");
+        appendUserBlocks([{ type: "text", text: `<platform_notice>\n${content}\n</platform_notice>` }]);
         break;
+      }
       case "tool":
         appendUserBlocks([
           {

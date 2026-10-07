@@ -23,6 +23,7 @@ const rl = createInterface({ input: stdin, output: stdout, prompt: "you> " });
 const unconfirmed: string[] = []; // sent, but no turn.started for them yet
 const ourTurns = new Set<string>(); // started from this client, not finished
 const streamedTurns = new Set<string>(); // turns whose reply arrived as deltas
+let closed = false; // the input side is done (Ctrl+D, Ctrl+C, end of piped input)
 let streaming = false; // a reply is being written on the current line
 const deferred: string[] = []; // background lines held back until that reply ends
 
@@ -32,7 +33,11 @@ function print(text: string): void {
   clearLine(stdout, 0);
   cursorTo(stdout, 0);
   stdout.write(`${text}\n`);
-  rl.prompt(true);
+  prompt();
+}
+
+function prompt(): void {
+  if (!closed) rl.prompt(true);
 }
 
 /** For lines unrelated to the reply being streamed (tasks, other clients): don't split the reply. */
@@ -52,7 +57,7 @@ function finishTurn(turnId: string): void {
   streamedTurns.delete(turnId);
   endStreamedLine();
   for (const text of deferred.splice(0)) print(text);
-  rl.prompt(true);
+  prompt();
 }
 
 function firstLine(text: unknown): string {
@@ -135,4 +140,7 @@ rl.on("SIGINT", () => {
   ws.send(JSON.stringify({ type: "cancel_turn" }));
 });
 
-rl.on("close", () => ws.close(1000));
+rl.on("close", () => {
+  closed = true;
+  ws.close(1000);
+});
