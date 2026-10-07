@@ -59,7 +59,9 @@ function serializeErrors(_key: string, value: unknown): unknown {
 // 14:23:01.123 INFO  llm.request         conversationId=test-1 messageCount=1
 function formatPretty(record: { time: string; level: LogLevel; event: string } & LogFields): string {
   const { time, level, event, ...fields } = record;
-  const parts = Object.entries(fields).map(([key, value]) => `${key}=${formatValue(value)}`);
+  const parts = Object.entries(fields)
+    .filter(([, value]) => value !== undefined) // match JSON output, which drops them
+    .map(([key, value]) => `${key}=${formatValue(value)}`);
   return `${time.slice(11, 23)} ${level.toUpperCase().padEnd(5)} ${event.padEnd(18)} ${parts.join(" ")}`;
 }
 

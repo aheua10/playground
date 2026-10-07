@@ -6,9 +6,20 @@ import { createHttpServer } from "../src/http/server.ts";
 import { StubLLMProvider } from "../src/llm/stub-llm-provider.ts";
 import { createLogger } from "../src/logger.ts";
 import { AgentRuntime } from "../src/runtime/agent-runtime.ts";
+import { createGetCurrentTimeTool } from "../src/tools/get-current-time.ts";
+import { ToolExecutor } from "../src/tools/tool-executor.ts";
+import { ToolRegistry } from "../src/tools/tool-registry.ts";
+import { FIXED_NOW } from "./helpers.ts";
 
 const logger = createLogger({ level: "error", format: "json", write: () => {} });
-const runtime = new AgentRuntime({ llm: new StubLLMProvider(), store: new InMemoryConversationStore(), logger });
+const registry = new ToolRegistry();
+registry.register(createGetCurrentTimeTool(() => FIXED_NOW));
+const runtime = new AgentRuntime({
+  llm: new StubLLMProvider(),
+  store: new InMemoryConversationStore(),
+  toolExecutor: new ToolExecutor({ registry }),
+  logger,
+});
 const server = createHttpServer({ runtime, logger });
 let baseUrl: string;
 
@@ -37,6 +48,30 @@ test("POST /messages returns the assistant reply", async () => {
   assert.equal(body.conversationId, "test-1");
   assert.equal(typeof body.turnId, "string");
   assert.match(body.reply, /You said: "Hello"/);
+});
+
+test("POST /messages runs a tool when the (stub) model asks for one", async () => {
+  const res = await postJson("/messages", { conversationId: "time-1", message: "What time is it in Asia/Tokyo?" });
+
+  assert.equal(res.status, 200);
+  const { reply } = await res.json();
+  assert.match(reply, /get_current_time returned: .*"local":"Wednesday, October 7, 2026 at 9:00:00 PM GMT\+9"/);
+});
+
+test("GET /conversations/:id returns the stored turn, including the tool call and result", async () => {
+  await postJson("/messages", { conversationId: "time-2", message: "What time is it?" });
+
+  const res = await fetch(baseUrl + "/conversations/time-2");
+
+  assert.equal(res.status, 200);
+  const { messages } = await res.json();
+  assert.deepEqual(
+    messages.map((m: { role: string }) => m.role),
+    ["user", "assistant", "tool", "assistant"],
+  );
+  assert.equal(messages[1].toolCalls[0].name, "get_current_time");
+  assert.equal((await fetch(baseUrl + "/conversations/unknown")).status, 404);
+  assert.equal((await fetch(baseUrl + "/conversations/bad%20id")).status, 400);
 });
 
 test("POST /messages rejects invalid input with 400", async () => {

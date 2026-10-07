@@ -10,8 +10,9 @@ import type { AgentRuntime, TurnInput } from "../runtime/agent-runtime.ts";
 // No conversation or agent logic lives here.
 //
 // Routes:
-//   GET  /health    liveness check for Docker / load balancers
-//   POST /messages  { conversationId, message } -> { conversationId, turnId, reply }
+//   GET  /health              liveness check for Docker / load balancers
+//   POST /messages            { conversationId, message } -> { conversationId, turnId, reply }
+//   GET  /conversations/:id   stored history, including tool calls and results (debugging)
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_MESSAGE_CHARS = 32_000;
@@ -19,7 +20,7 @@ const MAX_MESSAGE_CHARS = 32_000;
 const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export interface HttpServerDeps {
-  runtime: Pick<AgentRuntime, "runTurn">;
+  runtime: Pick<AgentRuntime, "runTurn" | "getHistory">;
   logger: Logger;
 }
 
@@ -42,14 +43,22 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Ht
   const startedAt = performance.now();
   const method = req.method ?? "GET";
   const path = new URL(req.url ?? "/", "http://localhost").pathname;
+  // If the client goes away before we respond, cancel the work done on its
+  // behalf (the in-flight LLM call and tool executions).
+  const clientGone = new AbortController();
+  res.on("close", () => {
+    if (!res.writableFinished) clientGone.abort(new Error("Client disconnected"));
+  });
   let status: number;
 
   try {
-    const body = await route(method, path, req, deps);
+    const body = await route(method, path, req, clientGone.signal, deps);
     status = 200;
     sendJson(res, status, body);
   } catch (error) {
-    if (error instanceof HttpError) {
+    if (clientGone.signal.aborted) {
+      status = 499; // nginx's "client closed request"; for the log only, nobody is listening
+    } else if (error instanceof HttpError) {
       status = error.status;
       sendJson(res, status, { error: error.message });
       deps.logger.warn("http.rejected", { method, path, status, reason: error.message });
@@ -64,7 +73,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Ht
   deps.logger.debug("http.request", { method, path, status, durationMs: Math.round(performance.now() - startedAt) });
 }
 
-async function route(method: string, path: string, req: IncomingMessage, deps: HttpServerDeps): Promise<unknown> {
+async function route(
+  method: string,
+  path: string,
+  req: IncomingMessage,
+  signal: AbortSignal,
+  deps: HttpServerDeps,
+): Promise<unknown> {
   if (path === "/health") {
     requireMethod(method, "GET");
     return { status: "ok" };
@@ -73,7 +88,19 @@ async function route(method: string, path: string, req: IncomingMessage, deps: H
   if (path === "/messages") {
     requireMethod(method, "POST");
     const input = parseMessageRequest(await readJsonBody(req));
-    return await deps.runtime.runTurn(input);
+    return await deps.runtime.runTurn(input, signal);
+  }
+
+  const conversationPath = /^\/conversations\/([^/]+)$/.exec(path);
+  if (conversationPath) {
+    requireMethod(method, "GET");
+    // The allowed charset needs no percent-decoding, so match the raw segment.
+    const conversationId = conversationPath[1]!;
+    if (!CONVERSATION_ID_PATTERN.test(conversationId)) throw new HttpError(400, "Invalid conversationId");
+    const messages = await deps.runtime.getHistory(conversationId);
+    if (messages.length === 0) throw new HttpError(404, "Conversation not found");
+    // `raw` is opaque provider state (e.g. signed thinking blocks): omit it for readability.
+    return { conversationId, messages: messages.map((m) => (m.role === "assistant" ? { ...m, raw: undefined } : m)) };
   }
 
   throw new HttpError(404, "Not found");

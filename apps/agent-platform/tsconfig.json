@@ -6,7 +6,7 @@
   //   - erasableSyntaxOnly forbids enums/namespaces/parameter properties
   //   - verbatimModuleSyntax forces `import type` for type-only imports
   "compilerOptions": {
-    "target": "es2023",
+    "target": "es2024",
     "module": "nodenext",
     "strict": true,
     "noUncheckedIndexedAccess": true,
