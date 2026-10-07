@@ -34,8 +34,9 @@ async function startServer(t: TestContext, llm: LLMProvider = new StubLLMProvide
   const events = new ConversationEvents(logger);
   const toolExecutor = new ToolExecutor({ registry: new ToolRegistry() });
   const runtime = new AgentRuntime({ llm, store: new InMemoryConversationStore(), toolExecutor, logger, events });
-  const server = createHttpServer({ runtime, tasks: { list: async () => [] }, logger });
-  const realtime = attachRealtime(server, { runtime, events, logger, allowedOrigins: [ALLOWED_ORIGIN] });
+  const allowedHosts: string[] = [];
+  const server = createHttpServer({ runtime, tasks: { list: async () => [] }, logger, allowedHosts });
+  const realtime = attachRealtime(server, { runtime, events, logger, allowedHosts, allowedOrigins: [ALLOWED_ORIGIN] });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(() => {
@@ -177,7 +178,7 @@ test("an oversized frame closes the connection", async (t) => {
   assert.equal(event.code, 1009); // message too big
 });
 
-test("the handshake checks path, Origin and conversationId", async (t) => {
+test("the handshake checks Host, path, Origin and conversationId", async (t) => {
   const { base, lines } = await startServer(t);
 
   assert.equal(await handshake(base, "/realtime?conversationId=c1", { origin: ALLOWED_ORIGIN }), 101);
@@ -187,5 +188,8 @@ test("the handshake checks path, Origin and conversationId", async (t) => {
   assert.equal(await handshake(base, "/realtime?conversationId=../x"), 400);
   assert.equal(await handshake(base, "/realtime"), 400);
   assert.equal(await handshake(base, "/elsewhere?conversationId=c1"), 404);
-  assert.equal(lines.filter((line) => line.event === "realtime.rejected").length, 5);
+  // DNS rebinding: the page's own origin is allowed by the Origin check, but the Host gives it away.
+  const rebound = { host: "evil.example:3000", origin: "http://evil.example:3000" };
+  assert.equal(await handshake(base, "/realtime?conversationId=c1", rebound), 403);
+  assert.equal(lines.filter((line) => line.event === "realtime.rejected").length, 6);
 });

@@ -83,6 +83,7 @@ the coding worker it only writes a `NOTES.md` (and runs one command with
 | `REPOSITORIES`      | (none)                         | `name=url[#baseBranch]`, comma-separated: the repositories tasks may use |
 | `GIT_TOKEN`         | (none)                         | token for private clones and pushes (host-side git only) |
 | `ALLOW_GIT_PUSH`    | `false`                        | `true` registers `publish_task`         |
+| `ALLOWED_HOSTS`     | (none)                         | host names, besides `localhost` and IP addresses, that requests may be addressed to |
 | `ALLOWED_ORIGINS`   | `http://localhost:PORT`, `http://127.0.0.1:PORT` | web origins whose pages may open `/realtime` |
 
 `LOG_LEVEL=debug` also logs the full payload of every LLM request (system
@@ -100,6 +101,15 @@ prompt, tool definitions, messages): exactly what the model is told.
 
 If the client disconnects mid-turn, the turn is cancelled (LLM call and tools
 aborted) and nothing is persisted.
+
+**Every request must be addressed to this server** (`src/http/host-check.ts`):
+its `Host` header must be `localhost`, an IP address, or a name in
+`ALLOWED_HOSTS` (any port); anything else gets 403. This stops DNS rebinding:
+a page you open at `evil.example` switches its DNS record to `127.0.0.1`, and
+its requests then reach the agent through your tunnel as same-origin, so CORS
+doesn't apply. They still carry `Host: evil.example`. No other site can make
+your browser send `Host: localhost` or an IP address, so those are always
+allowed.
 
 ## The agent loop
 
@@ -314,9 +324,10 @@ REST, sockets, notices: every turn publishes the same events
   Notices queue behind the user's turn, like any other turn.
 - **Who may connect.** Browsers don't apply CORS to WebSockets: without a
   check, any web page open in your browser could connect to `localhost:3000`
-  and drive the agent. The handshake's `Origin` must be in `ALLOWED_ORIGINS`.
-  Clients that aren't browsers (curl, `npm run chat`) send no `Origin` and
-  are allowed. This keeps other websites out; it is not authentication.
+  and drive the agent. The handshake must pass the same `Host` check as REST,
+  and its `Origin` must be in `ALLOWED_ORIGINS`. Clients that aren't browsers
+  (curl, `npm run chat`) send no `Origin` and are allowed. These checks keep
+  other websites out; they are not authentication.
 - **Limits.** 64 KiB per frame (bigger closes the socket with 1009), the same
   text limit as REST, 3 turns in flight per socket, 1 MiB of unsent output
   before a slow client is dropped, and a 30 s ping that drops dead
@@ -333,6 +344,7 @@ src/
     server.ts                HTTP transport adapter (node:http)
     realtime.ts              WebSocket transport (/realtime): events out, messages in
     input-rules.ts           client input limits shared by both transports
+    host-check.ts            DNS-rebinding defence: the Host header must name this server
   events/
     conversation-events.ts   the in-process event bus and its event types
   runtime/
@@ -416,9 +428,9 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
 | `sandbox.runs_as_root`| warning: sandboxed commands would run as uid 0              |
 | `git.cloned` / `git.committed` / `git.pushed` | repository checkout, per-attempt commit, publish (repository, branch, commit) |
 | `git.clone_failed` / `git.push_failed` | clone or push failed (details in the log, a short reason to the model) |
-| `http.rejected`       | 4xx: client input refused at the transport                 |
+| `http.rejected`       | 4xx: client input refused at the transport (including a `Host` that isn't allowed) |
 | `realtime.connected` / `realtime.disconnected` | a WebSocket opened / closed (`connectionId`; turns cancelled by the close) |
-| `realtime.rejected`   | handshake refused (wrong path, `Origin` not allowed, bad conversationId) |
+| `realtime.rejected`   | handshake refused (`Host` or `Origin` not allowed, wrong path, bad conversationId) |
 | `realtime.invalid_message` | a client message was rejected (sent back as `error`)  |
 | `realtime.cancel_turn` | the client cancelled its turns                            |
 | `realtime.slow_client` | dropped: too much unsent output                           |
@@ -450,10 +462,9 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
   connected; the reply waits in the history.
 - Workspaces and checkouts are never cleaned up. Each task clones the whole
   base branch; submodules and Git LFS aren't supported.
-- The HTTP API has no authentication: keep it private (see DEPLOY.md).
-  `ALLOWED_ORIGINS` protects the WebSocket from other websites, but REST
-  doesn't check the `Host` header, so a DNS-rebinding page in your browser
-  could still reach REST through the tunnel. Authentication closes both.
+- The HTTP API has no authentication: keep it private (see DEPLOY.md). The
+  `Host` and `Origin` checks keep other websites out, but anyone who can
+  reach the port directly can use it.
 - An in-process tool that ignores its abort signal keeps running after a
   timeout; the runtime just stops waiting. (Sandboxed commands don't have
   this problem: their container is removed.)

@@ -3,6 +3,7 @@ import type { Logger } from "../logger.ts";
 import type { AgentRuntime, TurnInput } from "../runtime/agent-runtime.ts";
 import { describeTask } from "../tasks/task.ts";
 import type { TaskManager } from "../tasks/task-manager.ts";
+import { isAllowedHost } from "./host-check.ts";
 import { CONVERSATION_ID_PATTERN, MAX_MESSAGE_CHARS } from "./input-rules.ts";
 
 // HTTP transport adapter. Its whole job:
@@ -11,6 +12,9 @@ import { CONVERSATION_ID_PATTERN, MAX_MESSAGE_CHARS } from "./input-rules.ts";
 //   3. call the runtime
 //   4. map the result (or error) back to an HTTP response
 // No conversation or agent logic lives here.
+//
+// Before routing, the Host header must name this server (host-check.ts), so a
+// DNS-rebinding page in the user's browser can't use the API.
 //
 // Routes:
 //   GET  /health              liveness check for Docker / load balancers
@@ -26,6 +30,8 @@ export interface HttpServerDeps {
   runtime: Pick<AgentRuntime, "runTurn" | "getHistory">;
   tasks: Pick<TaskManager, "list">;
   logger: Logger;
+  /** Host names allowed besides localhost and IP addresses (ALLOWED_HOSTS). */
+  allowedHosts: readonly string[];
 }
 
 class HttpError extends Error {
@@ -38,12 +44,18 @@ class HttpError extends Error {
 }
 
 export function createHttpServer(deps: HttpServerDeps): Server {
+  const allowedHosts = new Set(deps.allowedHosts);
   return createServer((req, res) => {
-    void handleRequest(req, res, deps);
+    void handleRequest(req, res, deps, allowedHosts);
   });
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: HttpServerDeps): Promise<void> {
+async function handleRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: HttpServerDeps,
+  allowedHosts: ReadonlySet<string>,
+): Promise<void> {
   const startedAt = performance.now();
   const method = req.method ?? "GET";
   const path = new URL(req.url ?? "/", "http://localhost").pathname;
@@ -56,6 +68,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Ht
   let status: number;
 
   try {
+    if (!isAllowedHost(req.headers.host, allowedHosts)) throw new HttpError(403, "Host not allowed");
     const body = await route(method, path, req, clientGone.signal, deps);
     status = 200;
     sendJson(res, status, body);
@@ -65,7 +78,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Ht
     } else if (error instanceof HttpError) {
       status = error.status;
       sendJson(res, status, { error: error.message });
-      deps.logger.warn("http.rejected", { method, path, status, reason: error.message });
+      deps.logger.warn("http.rejected", { method, path, status, reason: error.message, host: req.headers.host });
     } else {
       // Never leak internal error details to the client; they go to the logs.
       status = 500;

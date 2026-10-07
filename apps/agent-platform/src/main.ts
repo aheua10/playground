@@ -52,13 +52,15 @@ const store = new InMemoryConversationStore();
 const toolExecutor = new ToolExecutor({ registry: toolRegistry });
 const runtime = new AgentRuntime({ llm, store, toolExecutor, logger, events });
 startTaskNotifier({ events, runtime });
-const server = createHttpServer({ runtime, tasks, logger });
-const realtime = attachRealtime(server, { runtime, events, logger, allowedOrigins: config.allowedOrigins });
+const { allowedHosts, allowedOrigins } = config;
+const server = createHttpServer({ runtime, tasks, logger, allowedHosts });
+const realtime = attachRealtime(server, { runtime, events, logger, allowedHosts, allowedOrigins });
 
 server.listen(config.port, () => {
   logger.info("server.started", {
     port: config.port,
-    realtime: { path: "/realtime", allowedOrigins: config.allowedOrigins },
+    allowedHosts: ["localhost", "IP addresses", ...allowedHosts],
+    realtime: { path: "/realtime", allowedOrigins },
     llmProvider: llm.name,
     model: config.llm.provider === "anthropic" ? config.llm.model : undefined,
     tools: toolExecutor.definitions().map((tool) => tool.name),

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { hostnameOf } from "./http/host-check.ts";
 import type { Effort } from "./llm/anthropic-provider.ts";
 import { parseRepositories, type Repository } from "./repositories/repository-catalog.ts";
 import type { LogFormat, LogLevel } from "./logger.ts";
@@ -30,6 +31,8 @@ export type TaskWorkerConfig =
 
 export interface Config {
   port: number;
+  /** Host names, besides localhost and IP addresses, that requests may be addressed to. */
+  allowedHosts: string[];
   /** Web origins whose pages may open the realtime WebSocket. */
   allowedOrigins: string[];
   logLevel: LogLevel;
@@ -42,6 +45,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const port = parsePort(env.PORT ?? "3000");
   return {
     port,
+    allowedHosts: parseHostnames(env.ALLOWED_HOSTS),
     allowedOrigins: parseOrigins(env.ALLOWED_ORIGINS, port),
     logLevel: parseOneOf("LOG_LEVEL", env.LOG_LEVEL ?? "info", ["debug", "info", "warn", "error"]),
     // Default to readable logs in a terminal, JSON everywhere else.
@@ -103,6 +107,18 @@ function parsePort(raw: string): number {
     throw new Error(`Invalid PORT: "${raw}" (expected an integer 1-65535)`);
   }
   return port;
+}
+
+// Names only: the port is never part of the check (see http/host-check.ts).
+function parseHostnames(raw: string | undefined): string[] {
+  if (!raw?.trim()) return [];
+  return raw.split(",").map((entry) => {
+    const name = entry.trim().toLowerCase();
+    if (hostnameOf(name) !== name || name.includes(":")) {
+      throw new Error(`Invalid ALLOWED_HOSTS entry: "${entry.trim()}" (expected a host name like agent.example.com, without a port)`);
+    }
+    return name;
+  });
 }
 
 // Default: pages served from this port on localhost, i.e. a web UI served by

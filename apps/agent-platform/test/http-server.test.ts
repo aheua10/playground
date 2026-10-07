@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import { InMemoryConversationStore } from "../src/conversation/in-memory-conversation-store.ts";
@@ -30,7 +31,7 @@ const runtime = new AgentRuntime({
   toolExecutor: new ToolExecutor({ registry }),
   logger,
 });
-const server = createHttpServer({ runtime, tasks, logger });
+const server = createHttpServer({ runtime, tasks, logger, allowedHosts: ["agent.internal"] });
 let baseUrl: string;
 
 before(async () => {
@@ -132,4 +133,26 @@ test("GET /health reports ok", async () => {
   const res = await fetch(baseUrl + "/health");
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { status: "ok" });
+});
+
+/** GET /health with a chosen Host header (fetch doesn't let us set one). */
+function healthWithHost(host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = request(`${baseUrl}/health`, { headers: { host } }, (res) => {
+      res.resume();
+      resolve(res.statusCode!);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+test("requests must be addressed to localhost, an IP address, or an allowed host name", async () => {
+  for (const host of ["localhost:3000", "127.0.0.1:3000", "[::1]:3000", "10.0.0.5", "agent.internal", "AGENT.INTERNAL:8080"]) {
+    assert.equal(await healthWithHost(host), 200, host);
+  }
+  // What a DNS-rebinding page sends: its own name, now pointing at us.
+  for (const host of ["evil.example:3000", "localhost.evil.example", "agent.internal.evil.example", "evil.example/x"]) {
+    assert.equal(await healthWithHost(host), 403, host);
+  }
 });

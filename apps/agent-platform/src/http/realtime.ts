@@ -5,6 +5,7 @@ import { type RawData, WebSocket, WebSocketServer } from "ws";
 import type { ConversationEvent, ConversationEvents } from "../events/conversation-events.ts";
 import type { Logger } from "../logger.ts";
 import type { AgentRuntime } from "../runtime/agent-runtime.ts";
+import { isAllowedHost } from "./host-check.ts";
 import { CONVERSATION_ID_PATTERN, MAX_MESSAGE_CHARS } from "./input-rules.ts";
 
 // The realtime channel: a WebSocket per client, on the same port as the REST
@@ -25,7 +26,8 @@ import { CONVERSATION_ID_PATTERN, MAX_MESSAGE_CHARS } from "./input-rules.ts";
 // any web page open in the user's browser could connect to localhost and drive
 // the agent. The handshake's Origin header must therefore be on an allowlist.
 // Clients that aren't browsers (the CLI) send no Origin and are let through:
-// this check stops other websites, it is not authentication.
+// this check stops other websites, it is not authentication. The Host header
+// is checked first, as for every REST request (host-check.ts).
 
 const PATH = "/realtime";
 /** A client message is a small JSON object; anything bigger closes the socket (1009). */
@@ -40,6 +42,8 @@ export interface RealtimeDeps {
   runtime: Pick<AgentRuntime, "runTurn">;
   events: Pick<ConversationEvents, "subscribe">;
   logger: Logger;
+  /** Host names allowed besides localhost and IP addresses (ALLOWED_HOSTS). */
+  allowedHosts: readonly string[];
   /** Origins (scheme://host:port) whose pages may connect. */
   allowedOrigins: readonly string[];
 }
@@ -51,6 +55,7 @@ export interface Realtime {
 
 export function attachRealtime(server: Server, deps: RealtimeDeps): Realtime {
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES });
+  const allowedHosts = new Set(deps.allowedHosts);
   const allowedOrigins = new Set(deps.allowedOrigins);
   // Clients that answered the latest ping (see the heartbeat below).
   const alive = new WeakSet<WebSocket>();
@@ -64,12 +69,13 @@ export function attachRealtime(server: Server, deps: RealtimeDeps): Realtime {
     const origin = req.headers.origin;
 
     let refusal: [status: number, reason: string] | undefined;
-    if (url.pathname !== PATH) refusal = [404, "Not Found"];
+    if (!isAllowedHost(req.headers.host, allowedHosts)) refusal = [403, "Forbidden"];
+    else if (url.pathname !== PATH) refusal = [404, "Not Found"];
     else if (origin !== undefined && !allowedOrigins.has(origin)) refusal = [403, "Forbidden"];
     else if (!CONVERSATION_ID_PATTERN.test(conversationId)) refusal = [400, "Bad Request"];
     if (refusal) {
       const [status, reason] = refusal;
-      deps.logger.warn("realtime.rejected", { path: url.pathname, status, origin });
+      deps.logger.warn("realtime.rejected", { path: url.pathname, status, host: req.headers.host, origin });
       socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
       return;
     }

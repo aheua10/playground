@@ -109,10 +109,11 @@ curl -s -X POST localhost:3000/messages -H 'content-type: application/json' \
 curl -s localhost:3000/conversations/demo/tasks
 ```
 
-The tunnel carries the WebSocket (`/realtime`) as well as REST. Browser pages
-may connect only from the origins in `ALLOWED_ORIGINS` (by default
-`http://localhost:3000`), so keep the same local port on both ends of the
-tunnel, or add your local origin there.
+The tunnel carries the WebSocket (`/realtime`) as well as REST. Requests
+through it are addressed to `localhost`, which the agent always accepts (any
+port). Browser pages may open the WebSocket only from the origins in
+`ALLOWED_ORIGINS` (by default `http://localhost:3000`), so keep the same local
+port on both ends of the tunnel, or add your local origin there.
 
 The tunnel ends at `localhost`, which browsers treat as a secure context. A
 later voice UI can therefore use the microphone through it without setting up
@@ -132,4 +133,5 @@ TLS first.
 
 Do these first: authentication on the API, HTTPS (an ALB with an ACM
 certificate, or a reverse proxy), and persistent conversation and task
-storage.
+storage. Then add the name clients will use to `ALLOWED_HOSTS` (and, for a
+browser UI, its origin to `ALLOWED_ORIGINS`): any other name is refused.
