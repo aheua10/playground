@@ -1,15 +1,19 @@
-import { loadConfig, type LLMConfig } from "./config.ts";
+import { loadConfig, type LLMConfig, type TaskWorkerConfig } from "./config.ts";
 import { InMemoryConversationStore } from "./conversation/in-memory-conversation-store.ts";
 import { createHttpServer } from "./http/server.ts";
 import { AnthropicProvider } from "./llm/anthropic-provider.ts";
 import type { LLMProvider } from "./llm/llm-provider.ts";
 import { StubLLMProvider } from "./llm/stub-llm-provider.ts";
-import { createLogger } from "./logger.ts";
+import { createLogger, type Logger } from "./logger.ts";
 import { AgentRuntime } from "./runtime/agent-runtime.ts";
+import type { CommandSandbox } from "./sandbox/command-sandbox.ts";
+import { DockerCommandSandbox } from "./sandbox/docker-command-sandbox.ts";
+import { CodingWorker } from "./tasks/coding-worker.ts";
 import { SimulatedCodingWorker } from "./tasks/simulated-coding-worker.ts";
 import { TaskManager } from "./tasks/task-manager.ts";
 import { InMemoryTaskStore } from "./tasks/task-store.ts";
 import { createTaskTools } from "./tasks/task-tools.ts";
+import type { TaskWorker } from "./tasks/task-worker.ts";
 import { createGetCurrentTimeTool } from "./tools/get-current-time.ts";
 import { ToolExecutor } from "./tools/tool-executor.ts";
 import { ToolRegistry } from "./tools/tool-registry.ts";
@@ -21,14 +25,15 @@ import { ToolRegistry } from "./tools/tool-registry.ts";
 const config = loadConfig();
 const logger = createLogger({ level: config.logLevel, format: config.logFormat });
 
-const tasks = new TaskManager({ store: new InMemoryTaskStore(), worker: new SimulatedCodingWorker(), logger });
+const llm = createLLMProvider(config.llm);
+const worker = await createTaskWorker(config.worker, llm, logger);
+const tasks = new TaskManager({ store: new InMemoryTaskStore(), worker, logger });
 
 const toolRegistry = new ToolRegistry();
 toolRegistry.register(createGetCurrentTimeTool());
 for (const tool of createTaskTools(tasks)) toolRegistry.register(tool);
 
 const store = new InMemoryConversationStore();
-const llm = createLLMProvider(config.llm);
 const toolExecutor = new ToolExecutor({ registry: toolRegistry });
 const runtime = new AgentRuntime({ llm, store, toolExecutor, logger });
 const server = createHttpServer({ runtime, tasks, logger });
@@ -40,7 +45,9 @@ server.listen(config.port, () => {
     model: config.llm.provider === "anthropic" ? config.llm.model : undefined,
     tools: toolExecutor.definitions().map((tool) => tool.name),
     conversationStore: "in-memory",
-    taskWorker: "simulated",
+    taskWorker: config.worker.kind,
+    workspacesDir: config.worker.kind === "coding" ? config.worker.workspacesDir : undefined,
+    sandbox: config.worker.kind === "coding" ? config.worker.sandbox.kind : undefined,
   });
 });
 
@@ -51,6 +58,21 @@ function createLLMProvider(llmConfig: LLMConfig): LLMProvider {
     case "anthropic":
       return new AnthropicProvider({ model: llmConfig.model, effort: llmConfig.effort });
   }
+}
+
+async function createTaskWorker(workerConfig: TaskWorkerConfig, llm: LLMProvider, log: Logger): Promise<TaskWorker> {
+  if (workerConfig.kind === "simulated") return new SimulatedCodingWorker();
+
+  let sandbox: CommandSandbox | undefined;
+  if (workerConfig.sandbox.kind === "docker") {
+    const docker = new DockerCommandSandbox(workerConfig.sandbox);
+    await docker.verify(); // fail at startup, not in the middle of a task
+    if (process.getuid?.() === 0) {
+      log.warn("sandbox.runs_as_root", { hint: "run the agent as a non-root user; sandboxed commands use its uid" });
+    }
+    sandbox = docker;
+  }
+  return new CodingWorker({ llm, workspacesDir: workerConfig.workspacesDir, sandbox, logger: log });
 }
 
 // Containers stop us with SIGTERM (docker stop, ECS deploys). Stop accepting

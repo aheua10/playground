@@ -10,3 +10,9 @@ services:
     environment:
       PORT: "3000"
       LOG_FORMAT: ${LOG_FORMAT:-pretty} # "json" shows what production/CloudWatch logs look like
+      WORKSPACES_DIR: /workspaces
+    volumes:
+      - workspaces:/workspaces # task workspaces survive container restarts
+
+volumes:
+  workspaces:

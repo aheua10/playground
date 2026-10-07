@@ -5,10 +5,14 @@ import type { LLMProvider, LLMRequest, LLMResponse } from "./llm-provider.ts";
 // speaks the same protocol as a real model, including tool calls, so the whole
 // agent loop and task lifecycle can be exercised without an API key.
 //
-// If the last message is a tool result, it replies by quoting that result.
-// Otherwise the first matching rule below picks a tool call (only tools that
-// are actually offered count); "the task" means the most recent taskId seen in
-// the conversation. With no match it echoes the message.
+// As the conversation agent: if the last message is a tool result, it replies
+// by quoting that result. Otherwise the first matching rule below picks a tool
+// call (only tools that are actually offered count); "the task" means the most
+// recent taskId seen in the conversation. With no match it echoes the message.
+//
+// As the coding worker (recognised by being offered write_file): it writes a
+// NOTES.md with the requirements, runs one command if run_command is offered,
+// then summarizes. Enough to exercise the worker, workspace and sandbox.
 
 type Rule = {
   tool: string;
@@ -45,33 +49,54 @@ export class StubLLMProvider implements LLMProvider {
   #callCount = 0;
 
   async generate(request: LLMRequest): Promise<LLMResponse> {
+    const offered = new Set(request.tools.map((tool) => tool.name));
+    if (offered.has("write_file")) return this.#actAsCodingWorker(request, offered);
+
     const last = request.messages.at(-1);
     if (last?.role === "tool") {
       const outcome = last.isError ? "failed" : "returned";
-      return respond({ role: "assistant", content: `[stub] ${last.toolName} ${outcome}: ${last.content}`, toolCalls: [] });
+      return reply(`[stub] ${last.toolName} ${outcome}: ${last.content}`);
     }
 
     const text = request.messages.findLast((m) => m.role === "user")?.content ?? "";
-    const offered = new Set(request.tools.map((tool) => tool.name));
     const latestTaskId = findLatestTaskId(request.messages);
-
     for (const rule of RULES) {
       if (!offered.has(rule.tool) || !rule.pattern.test(text)) continue;
       const input = rule.input(text, latestTaskId);
       if (input === undefined) continue;
-      return respond({
-        role: "assistant",
-        content: "",
-        toolCalls: [{ id: `stub_call_${++this.#callCount}`, name: rule.tool, input }],
-      });
+      return this.#callTool(rule.tool, input);
     }
 
+    return reply(`[stub] You said: "${text}" (context: ${request.messages.length} messages)`);
+  }
+
+  #actAsCodingWorker(request: LLMRequest, offered: Set<string>): LLMResponse {
+    const results = request.messages.filter((m) => m.role === "tool");
+    const requirements = request.messages.find((m) => m.role === "user")?.content ?? "";
+    if (results.length === 0) {
+      return this.#callTool("write_file", {
+        path: "NOTES.md",
+        content: `# Task notes (written by the stub LLM)\n\n${requirements}\n`,
+      });
+    }
+    if (results.length === 1 && offered.has("run_command")) {
+      return this.#callTool("run_command", { command: "ls -la && node --version" });
+    }
+    const steps = results.map((r) => `${r.toolName} ${r.isError ? "failed" : "ok"}`).join(", ");
+    return reply(`[stub] Done: ${steps}. A real model would have written the code.`);
+  }
+
+  #callTool(name: string, input: object): LLMResponse {
     return respond({
       role: "assistant",
-      content: `[stub] You said: "${text}" (context: ${request.messages.length} messages)`,
-      toolCalls: [],
+      content: "",
+      toolCalls: [{ id: `stub_call_${++this.#callCount}`, name, input }],
     });
   }
+}
+
+function reply(content: string): LLMResponse {
+  return respond({ role: "assistant", content, toolCalls: [] });
 }
 
 function findLatestTaskId(messages: Message[]): string | undefined {

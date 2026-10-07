@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { Effort } from "./llm/anthropic-provider.ts";
 import type { LogFormat, LogLevel } from "./logger.ts";
 
@@ -13,11 +14,18 @@ export type LLMConfig =
   | { provider: "stub" }
   | { provider: "anthropic"; model: string; effort: Effort };
 
+export type SandboxConfig = { kind: "none" } | { kind: "docker"; image: string; network: "none" | "bridge" };
+
+export type TaskWorkerConfig =
+  | { kind: "simulated" }
+  | { kind: "coding"; workspacesDir: string; sandbox: SandboxConfig };
+
 export interface Config {
   port: number;
   logLevel: LogLevel;
   logFormat: LogFormat;
   llm: LLMConfig;
+  worker: TaskWorkerConfig;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -30,6 +38,28 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       "pretty",
     ]),
     llm: loadLLMConfig(env),
+    worker: loadWorkerConfig(env),
+  };
+}
+
+// Defaults: the real coding worker, editing files only (no sandbox), which
+// runs anywhere. SANDBOX=docker additionally lets it run commands.
+function loadWorkerConfig(env: NodeJS.ProcessEnv): TaskWorkerConfig {
+  const kind = parseOneOf("TASK_WORKER", env.TASK_WORKER ?? "coding", ["coding", "simulated"]);
+  if (kind === "simulated") return { kind };
+
+  const sandbox = parseOneOf("SANDBOX", env.SANDBOX ?? "none", ["none", "docker"]);
+  return {
+    kind,
+    workspacesDir: path.resolve(env.WORKSPACES_DIR ?? "./workspaces"),
+    sandbox:
+      sandbox === "none"
+        ? { kind: "none" }
+        : {
+            kind: "docker",
+            image: env.SANDBOX_IMAGE ?? "node:24-slim",
+            network: parseOneOf("SANDBOX_NETWORK", env.SANDBOX_NETWORK ?? "none", ["none", "bridge"]),
+          },
   };
 }
 
