@@ -29,9 +29,10 @@ here is the same `docker compose` setup you run locally.
 | Metadata       | IMDSv2 required, hop limit 1                   | containers can't fetch the instance role's credentials |
 | Network        | public subnet with a public IP, or private + NAT | outbound HTTPS to the Anthropic API, Docker Hub, npm, SSM |
 
-**Why no inbound ports:** the HTTP API has no authentication yet. Anyone who
-can reach port 3000 could spend your API credits and run code in your
-sandboxes.
+**Why no inbound ports:** the API requires a token now, but it speaks plain
+HTTP, so a token sent across the internet could be read on the way, and
+anyone holding it could spend your API credits and run code in your
+sandboxes. Traffic through the SSM tunnel is encrypted.
 
 ## 3. Set it up
 
@@ -63,7 +64,7 @@ LOG_FORMAT=json
 WORKSPACES_HOST_DIR=/srv/agent-workspaces
 DOCKER_GID=$(stat -c %g /var/run/docker.sock)
 EOF
-sudoedit .env   # add ANTHROPIC_API_KEY=..., and the repository settings below
+sudoedit .env   # add ANTHROPIC_API_KEY=..., AUTH_TOKENS=... (below), and the repository settings
 
 # Run it. It restarts with the Docker daemon, so it also survives reboots.
 sudo docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
@@ -72,6 +73,16 @@ sudo docker compose -f docker-compose.yml -f docker-compose.sandbox.yml logs -f
 
 `.env` serves two purposes: compose reads it to fill in `WORKSPACES_HOST_DIR`
 and `DOCKER_GID`, and the agent reads it for its configuration.
+
+The agent won't start without `AUTH_TOKENS`. Create a token **on your
+laptop**, from a checkout of this repository (Node.js >= 22.18, no
+`npm install` needed), so the token itself never exists on the instance:
+
+```sh
+cd apps/agent-platform && npm run create-token -- shai
+# put the printed AUTH_TOKENS=shai:<hash> line in the instance's .env,
+# and keep the token on your laptop: export AGENT_TOKEN=ap_...
+```
 
 To let tasks work on your repositories, add these to `.env`:
 
@@ -100,13 +111,14 @@ aws ssm start-session --target <instance-id> \
   --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["3000"],"localPortNumber":["3000"]}'
 
-# in another terminal, from a checkout of this repository (Node.js >= 22.18, no npm install needed)
+# in another terminal, from a checkout of this repository, with AGENT_TOKEN set
 cd apps/agent-platform && npm run chat -- demo
 
 # or plain REST
-curl -s -X POST localhost:3000/messages -H 'content-type: application/json' \
+curl -s -X POST localhost:3000/messages -H "Authorization: Bearer $AGENT_TOKEN" \
+  -H 'content-type: application/json' \
   -d '{"conversationId":"demo","message":"Create a TypeScript HTTP server with a /health route"}'
-curl -s localhost:3000/conversations/demo/tasks
+curl -s -H "Authorization: Bearer $AGENT_TOKEN" localhost:3000/conversations/demo/tasks
 ```
 
 The tunnel carries the WebSocket (`/realtime`) as well as REST. Requests
@@ -131,7 +143,7 @@ TLS first.
 
 ## Before exposing it beyond the tunnel
 
-Do these first: authentication on the API, HTTPS (an ALB with an ACM
-certificate, or a reverse proxy), and persistent conversation and task
+Do these first: HTTPS (an ALB with an ACM certificate, or a reverse proxy),
+token expiry or a real sign-in, and persistent conversation and task
 storage. Then add the name clients will use to `ALLOWED_HOSTS` (and, for a
 browser UI, its origin to `ALLOWED_ORIGINS`): any other name is refused.

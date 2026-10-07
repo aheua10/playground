@@ -4,7 +4,7 @@ A learning project: an agent runtime built without an agent framework, so the
 agent loop, the tool trust boundary, and the provider abstraction are all
 visible in our own code.
 
-**Status: Phase 5 complete.**
+**Status: Phase 5 complete, plus authentication.**
 - **Phase 1:** conversations over HTTP, an explicit agent loop, a native tool
   (`get_current_time`) behind a trust boundary, and two LLM providers: a
   deterministic stub (default, no API key) and Anthropic (Claude).
@@ -17,8 +17,10 @@ visible in our own code.
 - **Phase 5:** a realtime channel. A WebSocket streams replies, tool calls
   and task updates as they happen, and the agent speaks up on its own when a
   task finishes.
+- **Authentication:** bearer tokens per user, and conversations (with their
+  tasks) private to their user.
 
-Not yet: MCP, persistence, authentication, voice. Deploying: see
+Not yet: MCP, persistence, voice. Deploying: see
 [DEPLOY.md](DEPLOY.md).
 
 ## Run it
@@ -27,11 +29,17 @@ Requires Node.js >= 22.18 (runs TypeScript directly via built-in type stripping)
 
 ```sh
 npm install
-cp .env.example .env   # optional: pick the LLM provider here
-npm run dev            # node --watch, pretty logs in a terminal
-npm test               # node:test, no test framework dependency
+cp .env.example .env              # pick the LLM provider etc. here
+npm run create-token -- me        # prints a token, and an AUTH_TOKENS=... line for .env
+#   put the AUTH_TOKENS line in .env, and keep the token for yourself:
+export AGENT_TOKEN=ap_...
+npm run dev                       # node --watch, pretty logs in a terminal
+npm test                          # node:test, no test framework dependency
 npm run typecheck
 ```
+
+Without `AUTH_TOKENS` the server refuses to start. On a machine only you can
+reach, `AUTH=none` in `.env` switches authentication off instead.
 
 Or with Docker (reads the same `.env`):
 
@@ -42,21 +50,22 @@ docker compose up --build
 Then talk to it:
 
 ```sh
-say() { curl -s -X POST localhost:3000/messages -H 'content-type: application/json' \
-          -d "{\"conversationId\":\"demo\",\"message\":\"$1\"}"; echo; }
+api() { curl -s -H "Authorization: Bearer $AGENT_TOKEN" "$@"; echo; }
+say() { api -X POST localhost:3000/messages -H 'content-type: application/json' \
+          -d "{\"conversationId\":\"demo\",\"message\":\"$1\"}"; }
 
 say "What time is it in Asia/Tokyo?"
 say "Create a TypeScript server for this project."   # returns at once: task started
 say "Use Fastify instead of Express."                # revises the running task
 say "What is the status?"
-curl -s localhost:3000/conversations/demo/tasks      # progress, result, workspace path
-curl -s localhost:3000/conversations/demo            # the stored turns, with tool calls and results
+api localhost:3000/conversations/demo/tasks          # progress, result, workspace path
+api localhost:3000/conversations/demo                # the stored turns, with tool calls and results
 ```
 
 Or chat in a terminal, with replies streaming in as they're written:
 
 ```sh
-npm run chat              # a new conversation
+npm run chat              # a new conversation (uses AGENT_TOKEN)
 npm run chat -- demo      # join "demo": turns sent with curl above show up here too
 ```
 
@@ -72,6 +81,8 @@ the coding worker it only writes a `NOTES.md` (and runs one command with
 | `ANTHROPIC_API_KEY` | (required for `anthropic`)     |                                         |
 | `ANTHROPIC_MODEL`   | `claude-opus-5-5`              | any Claude model id                     |
 | `ANTHROPIC_EFFORT`  | `medium`                       | `low` `medium` `high` `xhigh` `max`     |
+| `AUTH`              | `tokens`                       | `tokens` `none`                         |
+| `AUTH_TOKENS`       | (required for `tokens`)        | `name:sha256hex`, comma-separated, from `npm run create-token` |
 | `PORT`              | `3000`                         | 1-65535                                 |
 | `LOG_LEVEL`         | `info`                         | `debug` `info` `warn` `error`           |
 | `LOG_FORMAT`        | `pretty` on a TTY, else `json` | `pretty` `json`                         |
@@ -96,11 +107,12 @@ prompt, tool definitions, messages): exactly what the model is told.
 | `POST /messages`          | `{ conversationId, message }` → `{ conversationId, turnId, reply }` |
 | `GET /conversations/:id`  | stored history, including tool calls and results (debugging)   |
 | `GET /conversations/:id/tasks` | the conversation's background tasks and their state       |
-| `GET /health`             | liveness check                                                 |
+| `GET /health`             | liveness check (the only route without a token)                |
 | `GET /realtime?conversationId=…` | WebSocket upgrade: the [realtime channel](#the-realtime-channel) |
 
-If the client disconnects mid-turn, the turn is cancelled (LLM call and tools
-aborted) and nothing is persisted.
+Every route except `/health` needs `Authorization: Bearer <token>` (see
+[Authentication](#authentication)). If the client disconnects mid-turn, the
+turn is cancelled (LLM call and tools aborted) and nothing is persisted.
 
 **Every request must be addressed to this server** (`src/http/host-check.ts`):
 its `Host` header must be `localhost`, an IP address, or a name in
@@ -110,6 +122,41 @@ its requests then reach the agent through your tunnel as same-origin, so CORS
 doesn't apply. They still carry `Host: evil.example`. No other site can make
 your browser send `Host: localhost` or an IP address, so those are always
 allowed.
+
+## Authentication
+
+```
+request ─► Host allowed? ─► bearer token ─► Authenticator ─► Principal { id: "alice" }
+               403               401                             │
+                                       conversationId "demo" ─► "alice/demo" everywhere inside
+```
+
+- **Tokens.** `npm run create-token -- <name>` prints a random token
+  (`ap_` + 32 random bytes) and the entry `name:sha256(token)` for
+  `AUTH_TOKENS`. The server stores only hashes, so its `.env`, a config dump
+  or a log can't be replayed to get in. (SHA-256 rather than bcrypt: slow
+  hashes protect guessable passwords; a 256-bit random token can't be
+  guessed.) Create tokens on your own machine; the token itself never needs
+  to exist on the server.
+- **Several tokens per user** (one per device, or old and new while rotating):
+  list each. Revoking one means removing its entry and restarting.
+- **Who you are decides what you see.** Each user's conversation ids live in
+  their own namespace: alice's `demo` is stored as `alice/demo`, bob's as
+  `bob/demo`. History, tasks, events and turn locks are all keyed by that id,
+  so isolation holds by construction; there is no ownership check that a new
+  route could forget. Bob gets 404 for alice's conversation, and a fresh
+  conversation of his own if he writes to the same id. Clients keep seeing
+  their own ids.
+- **Both transports**, the same way: REST and the WebSocket handshake read
+  the `Authorization` header (Node's WebSocket client can send it; the chat
+  client uses `AGENT_TOKEN`). Missing or unknown tokens get 401 before any
+  routing, so routes can't be probed. A browser UI can't set headers on a
+  WebSocket; it will need a sign-in that sets a cookie, or a short-lived
+  ticket.
+- **Pluggable.** Transports only call `Authenticator.authenticate(token)`. An
+  OIDC/JWT authenticator for real sign-in would be another implementation.
+- **`AUTH=none`** makes everyone the user `local`, and logs `auth.disabled` at
+  startup. Only for a machine nobody else can reach.
 
 ## The agent loop
 
@@ -327,7 +374,8 @@ REST, sockets, notices: every turn publishes the same events
   and drive the agent. The handshake must pass the same `Host` check as REST,
   and its `Origin` must be in `ALLOWED_ORIGINS`. Clients that aren't browsers
   (curl, `npm run chat`) send no `Origin` and are allowed. These checks keep
-  other websites out; they are not authentication.
+  other websites out; then, as for REST, the handshake needs a valid bearer
+  token, and the socket can only reach its own user's conversation.
 - **Limits.** 64 KiB per frame (bigger closes the socket with 1009), the same
   text limit as REST, 3 turns in flight per socket, 1 MiB of unsent output
   before a slow client is dropped, and a 30 s ping that drops dead
@@ -340,6 +388,9 @@ src/
   main.ts                    composition root: the only place concrete classes are chosen
   config.ts                  env vars -> typed config, fail fast
   logger.ts                  structured logger (event name + fields)
+  auth/
+    tokens.ts                token generation and hashing
+    authenticator.ts         Authenticator, Principal, per-user conversation scoping
   http/
     server.ts                HTTP transport adapter (node:http)
     realtime.ts              WebSocket transport (/realtime): events out, messages in
@@ -382,7 +433,9 @@ src/
     task-checkout.ts         clone / commit / push, git dir outside the sandbox
     publish-task-tool.ts     publish_task
   core/                      provider-neutral messages, tool definitions, KeyedMutex
-scripts/chat.ts              terminal client for the realtime channel (no dependencies)
+scripts/
+  chat.ts                    terminal client for the realtime channel (no dependencies)
+  create-token.ts            prints a new API token and its AUTH_TOKENS entry
 ```
 
 ```
@@ -428,9 +481,10 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
 | `sandbox.runs_as_root`| warning: sandboxed commands would run as uid 0              |
 | `git.cloned` / `git.committed` / `git.pushed` | repository checkout, per-attempt commit, publish (repository, branch, commit) |
 | `git.clone_failed` / `git.push_failed` | clone or push failed (details in the log, a short reason to the model) |
-| `http.rejected`       | 4xx: client input refused at the transport (including a `Host` that isn't allowed) |
+| `http.rejected`       | 4xx: refused at the transport (bad input, `Host` not allowed, 401 without a valid token); carries `principal` once known |
+| `auth.disabled`       | warning at startup: `AUTH=none`                            |
 | `realtime.connected` / `realtime.disconnected` | a WebSocket opened / closed (`connectionId`; turns cancelled by the close) |
-| `realtime.rejected`   | handshake refused (`Host` or `Origin` not allowed, wrong path, bad conversationId) |
+| `realtime.rejected`   | handshake refused (`Host` or `Origin` not allowed, wrong path, 401, bad conversationId) |
 | `realtime.invalid_message` | a client message was rejected (sent back as `error`)  |
 | `realtime.cancel_turn` | the client cancelled its turns                            |
 | `realtime.slow_client` | dropped: too much unsent output                           |
@@ -462,9 +516,11 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
   connected; the reply waits in the history.
 - Workspaces and checkouts are never cleaned up. Each task clones the whole
   base branch; submodules and Git LFS aren't supported.
-- The HTTP API has no authentication: keep it private (see DEPLOY.md). The
-  `Host` and `Origin` checks keep other websites out, but anyone who can
-  reach the port directly can use it.
+- Tokens don't expire, and revoking one needs a restart. Every user has the
+  same tools and repositories: there are no per-user permissions yet.
+- The API speaks plain HTTP, so a token is only as private as the network it
+  crosses. Keep the port private (the SSM tunnel in DEPLOY.md) until there is
+  HTTPS in front.
 - An in-process tool that ignores its abort signal keeps running after a
   timeout; the runtime just stops waiting. (Sandboxed commands don't have
   this problem: their container is removed.)
