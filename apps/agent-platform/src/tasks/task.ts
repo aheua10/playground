@@ -9,6 +9,8 @@ export interface Task {
   conversationId: string;
   /** The requirement the task was started with. */
   instruction: string;
+  /** Name of the repository (from the allowlist) the task works on; none = empty workspace. */
+  repository?: string;
   /** Later changes ("use Fastify instead of Express"), in order. */
   revisions: string[];
   status: TaskStatus;
@@ -45,6 +47,7 @@ export function describeTask(task: Task) {
   return {
     taskId: task.id,
     status: task.status,
+    repository: task.repository,
     attempt: task.attempt,
     requirements: requirementsOf(task),
     progress: task.progress,

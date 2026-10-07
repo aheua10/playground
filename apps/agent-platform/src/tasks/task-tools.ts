@@ -11,8 +11,30 @@ import { TaskError, type TaskManager } from "./task-manager.ts";
 
 const TASK_ID = { type: "string", pattern: "^task_[a-z0-9]+$", description: "The task id, e.g. task_3f2a9c01b4" };
 
-export function createTaskTools(tasks: TaskManager): Tool<never>[] {
-  const startCodingTask: Tool<{ instruction: string }> = {
+export interface TaskToolOptions {
+  /** Names of the repositories tasks may work on (the operator's allowlist). */
+  repositories?: string[];
+}
+
+export function createTaskTools(tasks: TaskManager, options: TaskToolOptions = {}): Tool<never>[] {
+  const repositories = options.repositories ?? [];
+  // The repository parameter only exists when repositories are configured,
+  // and its enum IS the allowlist: the executor rejects any other value
+  // before the task is created.
+  const repositoryProperty =
+    repositories.length > 0
+      ? {
+          repository: {
+            type: "string",
+            enum: repositories,
+            description:
+              `Work on this repository (a checkout on a new branch) instead of an empty workspace. ` +
+              `Available: ${repositories.join(", ")}. Use it when the user refers to their project or repository.`,
+          },
+        }
+      : {};
+
+  const startCodingTask: Tool<{ instruction: string; repository?: string }> = {
     definition: {
       name: "start_coding_task",
       description:
@@ -28,15 +50,16 @@ export function createTaskTools(tasks: TaskManager): Tool<never>[] {
             maxLength: 4000,
             description: "What to build, with every requirement the user has given so far.",
           },
+          ...repositoryProperty,
         },
         required: ["instruction"],
         additionalProperties: false,
       },
     },
-    execute: ({ instruction }, context) =>
+    execute: ({ instruction, repository }, context) =>
       handle(async () => {
-        const task = await tasks.start(context.conversationId, instruction);
-        return { taskId: task.id, status: task.status };
+        const task = await tasks.start(context.conversationId, instruction, { repository });
+        return { taskId: task.id, status: task.status, repository: task.repository };
       }),
   };
 

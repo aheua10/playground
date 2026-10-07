@@ -53,7 +53,7 @@ export class TaskManager {
     this.#maxRunning = deps.maxRunningPerConversation ?? DEFAULT_MAX_RUNNING_PER_CONVERSATION;
   }
 
-  async start(conversationId: string, instruction: string): Promise<Task> {
+  async start(conversationId: string, instruction: string, options: { repository?: string } = {}): Promise<Task> {
     // Not atomic with the save below; fine because turns, the only callers,
     // are serialized per conversation.
     const running = (await this.#store.listByConversation(conversationId)).filter((t) => t.status === "running");
@@ -68,6 +68,7 @@ export class TaskManager {
       id: `task_${randomUUID().replaceAll("-", "").slice(0, 10)}`,
       conversationId,
       instruction,
+      ...(options.repository && { repository: options.repository }),
       revisions: [],
       status: "running",
       attempt: 1,
@@ -77,7 +78,7 @@ export class TaskManager {
     };
     return this.#locks.run(task.id, async () => {
       await this.#store.save(task);
-      this.#log(task).info("task.started", { instruction });
+      this.#log(task).info("task.started", { instruction, repository: task.repository });
       this.#launch(task);
       return task;
     });
@@ -151,7 +152,13 @@ export class TaskManager {
     Promise.resolve()
       .then(() =>
         this.#worker.run(
-          { taskId, conversationId: task.conversationId, attempt, requirements: requirementsOf(task) },
+          {
+            taskId,
+            conversationId: task.conversationId,
+            attempt,
+            requirements: requirementsOf(task),
+            repository: task.repository,
+          },
           {
             signal: controller.signal,
             reportProgress: (note) => {

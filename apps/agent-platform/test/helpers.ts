@@ -1,6 +1,11 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { ToolCall } from "../src/core/messages.ts";
 import type { LLMProvider, LLMRequest, LLMResponse } from "../src/llm/llm-provider.ts";
 import { createLogger, type LogFields } from "../src/logger.ts";
+import { git } from "../src/repositories/git.ts";
+import type { Repository } from "../src/repositories/repository-catalog.ts";
 import type { TaskWorker, TaskWorkerContext, TaskWorkerInput } from "../src/tasks/task-worker.ts";
 
 /** Plays back pre-scripted responses and records every request it receives. */
@@ -82,4 +87,21 @@ export class ControlledWorker implements TaskWorker {
       this.runs.push({ input, context, resolve, reject });
     });
   }
+}
+
+export const AUTHOR = { "user.name": "Test", "user.email": "test@localhost" };
+
+/** A local bare repository standing in for GitHub, with one commit on main. */
+export async function createRemote(): Promise<{ repository: Repository; remoteDir: string }> {
+  const base = await mkdtemp(path.join(tmpdir(), "remote-"));
+  const remoteDir = path.join(base, "project.git");
+  const seed = path.join(base, "seed");
+  await git(["init", "--quiet", "--bare", "--initial-branch=main", remoteDir]);
+  await git(["init", "--quiet", "--initial-branch=main", seed]);
+  await writeFile(path.join(seed, "README.md"), "# Project\n");
+  await writeFile(path.join(seed, "package.json"), '{ "name": "project" }\n');
+  await git(["add", "--all"], { cwd: seed });
+  await git(["commit", "--quiet", "-m", "Initial commit"], { cwd: seed, config: AUTHOR });
+  await git(["push", "--quiet", remoteDir, "main"], { cwd: seed });
+  return { repository: { name: "project", url: `file://${remoteDir}` }, remoteDir };
 }

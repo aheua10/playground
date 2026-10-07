@@ -7,6 +7,8 @@ export interface TaskWorkerInput {
   attempt: number;
   /** The full current requirements: the original instruction, then each revision. */
   requirements: string[];
+  /** Repository name from the allowlist, if the task works on one. */
+  repository?: string;
 }
 
 export interface TaskWorkerContext {

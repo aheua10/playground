@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { Effort } from "./llm/anthropic-provider.ts";
+import { parseRepositories, type Repository } from "./repositories/repository-catalog.ts";
 import type { LogFormat, LogLevel } from "./logger.ts";
 
 // All configuration comes from environment variables, so the same image runs
@@ -18,7 +19,7 @@ export type SandboxConfig = { kind: "none" } | { kind: "docker"; image: string; 
 
 export type TaskWorkerConfig =
   | { kind: "simulated" }
-  | { kind: "coding"; workspacesDir: string; sandbox: SandboxConfig };
+  | { kind: "coding"; workspacesDir: string; sandbox: SandboxConfig; repositories: Repository[] };
 
 export interface Config {
   port: number;
@@ -52,6 +53,7 @@ function loadWorkerConfig(env: NodeJS.ProcessEnv): TaskWorkerConfig {
   return {
     kind,
     workspacesDir: path.resolve(env.WORKSPACES_DIR ?? "./workspaces"),
+    repositories: parseRepositories(env.REPOSITORIES),
     sandbox:
       sandbox === "none"
         ? { kind: "none" }

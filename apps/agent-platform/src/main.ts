@@ -5,6 +5,8 @@ import { AnthropicProvider } from "./llm/anthropic-provider.ts";
 import type { LLMProvider } from "./llm/llm-provider.ts";
 import { StubLLMProvider } from "./llm/stub-llm-provider.ts";
 import { createLogger, type Logger } from "./logger.ts";
+import { tokenAuth } from "./repositories/git.ts";
+import { RepositoryCatalog } from "./repositories/repository-catalog.ts";
 import { AgentRuntime } from "./runtime/agent-runtime.ts";
 import type { CommandSandbox } from "./sandbox/command-sandbox.ts";
 import { DockerCommandSandbox } from "./sandbox/docker-command-sandbox.ts";
@@ -26,12 +28,16 @@ const config = loadConfig();
 const logger = createLogger({ level: config.logLevel, format: config.logFormat });
 
 const llm = createLLMProvider(config.llm);
+const repositories = new RepositoryCatalog(config.worker.kind === "coding" ? config.worker.repositories : []);
+// Like ANTHROPIC_API_KEY, the git token is read from the environment here and
+// handed only to the code that uses it; it is not part of the config object.
+const gitAuth = tokenAuth(process.env.GIT_TOKEN);
 const worker = await createTaskWorker(config.worker, llm, logger);
 const tasks = new TaskManager({ store: new InMemoryTaskStore(), worker, logger });
 
 const toolRegistry = new ToolRegistry();
 toolRegistry.register(createGetCurrentTimeTool());
-for (const tool of createTaskTools(tasks)) toolRegistry.register(tool);
+for (const tool of createTaskTools(tasks, { repositories: repositories.names() })) toolRegistry.register(tool);
 
 const store = new InMemoryConversationStore();
 const toolExecutor = new ToolExecutor({ registry: toolRegistry });
@@ -48,6 +54,7 @@ server.listen(config.port, () => {
     taskWorker: config.worker.kind,
     workspacesDir: config.worker.kind === "coding" ? config.worker.workspacesDir : undefined,
     sandbox: config.worker.kind === "coding" ? config.worker.sandbox.kind : undefined,
+    repositories: repositories.names(),
   });
 });
 
@@ -72,7 +79,14 @@ async function createTaskWorker(workerConfig: TaskWorkerConfig, llm: LLMProvider
     }
     sandbox = docker;
   }
-  return new CodingWorker({ llm, workspacesDir: workerConfig.workspacesDir, sandbox, logger: log });
+  return new CodingWorker({
+    llm,
+    workspacesDir: workerConfig.workspacesDir,
+    sandbox,
+    repositories,
+    gitAuth,
+    logger: log,
+  });
 }
 
 // Containers stop us with SIGTERM (docker stop, ECS deploys). Stop accepting
