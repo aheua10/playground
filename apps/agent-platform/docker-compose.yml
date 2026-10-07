@@ -3,7 +3,10 @@ services:
     build: .
     ports:
       - "3000:3000"
+    env_file:
+      # Optional: copy .env.example to .env to configure the LLM provider.
+      - path: .env
+        required: false
     environment:
       PORT: "3000"
-      LOG_LEVEL: info
-      LOG_FORMAT: pretty # use "json" to see what production/CloudWatch logs look like
+      LOG_FORMAT: ${LOG_FORMAT:-pretty} # "json" shows what production/CloudWatch logs look like
