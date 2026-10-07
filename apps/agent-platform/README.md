@@ -4,10 +4,14 @@ A learning project: an agent runtime built without an agent framework, so the
 agent loop, the tool trust boundary, and the provider abstraction are all
 visible in our own code.
 
-**Status: Phase 1 complete.** Conversations over HTTP, an explicit agent loop,
-one native tool (`get_current_time`) behind a trust boundary, and two LLM
-providers: a deterministic stub (default, no API key) and Anthropic (Claude).
-Not yet: async tasks, MCP, persistence, voice.
+**Status: Phase 2 complete.**
+- **Phase 1:** conversations over HTTP, an explicit agent loop, a native tool
+  (`get_current_time`) behind a trust boundary, and two LLM providers: a
+  deterministic stub (default, no API key) and Anthropic (Claude).
+- **Phase 2:** background tasks the conversation can start, inspect, revise and
+  cancel while it carries on. The worker is simulated for now.
+
+Not yet: a real coding worker (needs sandboxing), MCP, persistence, realtime/voice.
 
 ## Run it
 
@@ -27,19 +31,23 @@ Or with Docker (reads the same `.env`):
 docker compose up --build
 ```
 
-Then ask something that needs the tool:
+Then talk to it:
 
 ```sh
-curl -s -X POST localhost:3000/messages \
-  -H 'content-type: application/json' \
-  -d '{"conversationId":"demo","message":"What time is it in Asia/Tokyo?"}'
+say() { curl -s -X POST localhost:3000/messages -H 'content-type: application/json' \
+          -d "{\"conversationId\":\"demo\",\"message\":\"$1\"}"; echo; }
 
-curl -s localhost:3000/conversations/demo   # the stored turn: user, tool call, tool result, reply
+say "What time is it in Asia/Tokyo?"
+say "Create a TypeScript server for this project."   # returns at once: task started
+say "Use Fastify instead of Express."                # revises the running task
+say "What is the status?"
+curl -s localhost:3000/conversations/demo/tasks      # watch progress; done after ~12 s
+curl -s localhost:3000/conversations/demo            # the stored turns, with tool calls and results
 ```
 
-With the stub, any message containing "time" triggers the tool, so the whole
-loop runs without an API key. For a real model set `LLM_PROVIDER=anthropic`
-and `ANTHROPIC_API_KEY` in `.env`.
+The stub picks tools by keyword (`time`; `create/build/write/...`; `instead/also/add/change`;
+`status/done`; `cancel/stop`), so all of this works without an API key. For a
+real model set `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` in `.env`.
 
 | Env var             | Default                        | Values                                  |
 | ------------------- | ------------------------------ | --------------------------------------- |
@@ -60,6 +68,7 @@ prompt, tool definitions, messages): exactly what the model is told.
 | ------------------------- | -------------------------------------------------------------- |
 | `POST /messages`          | `{ conversationId, message }` → `{ conversationId, turnId, reply }` |
 | `GET /conversations/:id`  | stored history, including tool calls and results (debugging)   |
+| `GET /conversations/:id/tasks` | the conversation's background tasks and their state       |
 | `GET /health`             | liveness check                                                 |
 
 If the client disconnects mid-turn, the turn is cancelled (LLM call and tools
@@ -82,12 +91,56 @@ happens. Every tool call passes `ToolExecutor` (`src/tools/tool-executor.ts`),
 the trust boundary:
 
 1. **exists**: only registered tools run, so the model can't invent capabilities
-2. **permitted**: policy hook (Phase 1: all tools are read-only, so all allowed)
+2. **permitted**: policy hook. No general policy yet: the only side effects are
+   task start/revise/cancel, scoped to the calling conversation by `TaskManager`
 3. **valid**: input must match the tool's JSON Schema (ajv, compiled at startup)
 4. **bounded**: timeout plus the turn's cancellation signal
 
 Rejections and failures go back to the model as error results it can react to.
 Only unexpected exceptions are hidden from it (details go to the logs).
+
+Turns are serialized per conversation: a message that arrives mid-turn waits
+(`turn.waiting`) and then sees the finished turn. Other conversations run in
+parallel. (Voice will later want "interrupt" instead of "queue"; that is a
+policy change in one place.)
+
+## Background tasks
+
+Work that takes longer than a turn runs as a task (`src/tasks/`). The agent
+drives tasks through five tools:
+
+| Tool                | Does                                                         |
+| ------------------- | ------------------------------------------------------------ |
+| `start_coding_task` | creates a task and returns `{ taskId, status: "running" }` at once |
+| `get_task`          | status, progress, result/error                               |
+| `list_tasks`        | all tasks in this conversation                               |
+| `revise_task`       | adds/changes a requirement; restarts the task as a new attempt |
+| `cancel_task`       | stops a running task for good                                |
+
+| From                  | To                                                          |
+| --------------------- | ----------------------------------------------------------- |
+| (start)               | `running` (attempt 1)                                       |
+| `running`             | `completed`, `failed`, `cancelled`, or `running` again via revise (new attempt) |
+| `completed`, `failed` | `running` via revise (new attempt)                          |
+| `cancelled`           | nothing: final                                              |
+
+- **`TaskManager` owns the lifecycle.** Every change goes through it, under a
+  per-task lock. Each revision starts a new *attempt*; an older attempt that
+  finishes late is ignored (`task.stale_update_dropped`), so "use Fastify"
+  can't be overwritten by the Express run that was still going.
+- **Tasks belong to a conversation.** The task tools take the conversation id
+  from the runtime, never from the model's input, so a model or a prompt
+  injection can only reach its own conversation's tasks. Unknown and foreign
+  task ids get the same "no task" answer.
+- **Limits.** At most 3 running tasks per conversation.
+- **The worker is pluggable** (`TaskWorker`). `SimulatedCodingWorker` reports
+  progress over ~12 s and returns a description of what it would build. A
+  real coding worker executes model-written code, so it waits for the
+  sandbox/permissions design.
+- **Pull, not push (for now).** The agent learns about progress when it calls
+  `get_task`/`list_tasks`, e.g. because the user asks. Telling the user
+  unprompted ("your server is ready") needs a realtime channel, which comes
+  with WebSockets/voice.
 
 ## Layout and dependency direction
 
@@ -100,6 +153,13 @@ src/
   runtime/
     agent-runtime.ts         the agent loop
     system-prompt.ts         static on purpose (prompt caching, thinking replay)
+  tasks/
+    task.ts                  Task type and allowed status transitions
+    task-manager.ts          lifecycle: start, revise, cancel, attempts, ownership
+    task-worker.ts           TaskWorker contract
+    simulated-coding-worker.ts  stand-in worker (no code is written)
+    task-store.ts            async store interface + in-memory impl
+    task-tools.ts            the five tools the agent uses to drive tasks
   tools/
     tool.ts                  Tool contract + ToolError
     tool-registry.ts         which tools exist; schema compilation
@@ -110,12 +170,13 @@ src/
     anthropic-provider.ts    Claude via the Anthropic SDK (the only file that knows its format)
     stub-llm-provider.ts     deterministic fake that speaks tool calls
   conversation/              async, append-only store interface + in-memory impl
-  core/                      provider-neutral messages and tool definitions
+  core/                      provider-neutral messages, tool definitions, KeyedMutex
 ```
 
 ```
 http ──► runtime ──► LLMProvider (interface)      ◄── anthropic, stub
-              ├────► ToolExecutor ──► ToolRegistry ◄── native tools (later: MCP tools)
+              ├────► ToolExecutor ──► ToolRegistry ◄── native tools, task tools (later: MCP tools)
+              │                                          └─► TaskManager ──► TaskWorker, TaskStore
               └────► ConversationStore (interface) ◄── in-memory
 everything ──► core/
 ```
@@ -123,7 +184,8 @@ everything ──► core/
 ## Log events
 
 Lines inside a turn carry `conversationId`, `turnId` and, inside the loop, `step`.
-Tool lines add `toolCallId` and `tool`.
+Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
+`taskId` and `attempt`.
 
 | Event                 | Meaning                                                    |
 | --------------------- | ---------------------------------------------------------- |
@@ -139,6 +201,14 @@ Tool lines add `toolCallId` and `tool`.
 | `final.response`      | turn finished                                              |
 | `turn.failed`         | turn aborted; history unchanged                            |
 | `turn.cancelled`      | caller cancelled (e.g. client disconnected)                |
+| `turn.waiting`        | another turn in this conversation is running; queued       |
+| `task.started`        | task created, attempt 1 launched                           |
+| `task.progress`       | worker progress note                                       |
+| `task.revised`        | requirement added; new attempt launched                    |
+| `task.completed`      | worker finished; result stored                             |
+| `task.failed`         | worker failed, or interrupted by shutdown                  |
+| `task.cancelled`      | stopped on request                                         |
+| `task.stale_update_dropped` | debug: late result from a superseded attempt ignored |
 | `http.rejected`       | 4xx: client input refused at the transport                 |
 | `http.error`          | 5xx: unexpected error (details only in logs)               |
 
@@ -157,10 +227,11 @@ Tool lines add `toolCallId` and `tool`.
 
 ## Known limitations (intentional for now)
 
-- Conversation state is in memory: lost on restart, so run a single instance.
-- Two concurrent turns on the same `conversationId` are not serialized. This
-  gets solved together with the async task model, since "a message arrives
-  mid-turn" is the same problem.
+- Conversations and tasks are in memory: lost on restart, so run a single
+  instance. On SIGTERM, running tasks are recorded as interrupted first.
+- Task work runs inside the server process. At scale it moves to a queue and
+  separate workers; `TaskManager` keeps its interface.
+- Task updates are pull-only (see Background tasks).
 - Responses are not streamed (needed later for voice).
 - A tool that ignores its abort signal keeps running after a timeout; the
   runtime just stops waiting. Real isolation (separate process/container)
