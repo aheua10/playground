@@ -1,4 +1,5 @@
-import { loadConfig, type LLMConfig, type TaskWorkerConfig } from "./config.ts";
+import { type Authenticator, NoAuthenticator, TokenAuthenticator } from "./auth/authenticator.ts";
+import { type AuthConfig, loadConfig, type LLMConfig, type TaskWorkerConfig } from "./config.ts";
 import { InMemoryConversationStore } from "./conversation/in-memory-conversation-store.ts";
 import { ConversationEvents } from "./events/conversation-events.ts";
 import { attachRealtime } from "./http/realtime.ts";
@@ -52,13 +53,16 @@ const store = new InMemoryConversationStore();
 const toolExecutor = new ToolExecutor({ registry: toolRegistry });
 const runtime = new AgentRuntime({ llm, store, toolExecutor, logger, events });
 startTaskNotifier({ events, runtime });
+const authenticator = createAuthenticator(config.auth);
 const { allowedHosts, allowedOrigins } = config;
-const server = createHttpServer({ runtime, tasks, logger, allowedHosts });
-const realtime = attachRealtime(server, { runtime, events, logger, allowedHosts, allowedOrigins });
+const server = createHttpServer({ runtime, tasks, logger, authenticator, allowedHosts });
+const realtime = attachRealtime(server, { runtime, events, logger, authenticator, allowedHosts, allowedOrigins });
 
 server.listen(config.port, () => {
   logger.info("server.started", {
     port: config.port,
+    auth: authenticator.kind,
+    principals: authenticator instanceof TokenAuthenticator ? authenticator.principals() : undefined,
     allowedHosts: ["localhost", "IP addresses", ...allowedHosts],
     realtime: { path: "/realtime", allowedOrigins },
     llmProvider: llm.name,
@@ -72,6 +76,12 @@ server.listen(config.port, () => {
     gitPush: config.worker.kind === "coding" && config.worker.allowGitPush,
   });
 });
+
+function createAuthenticator(authConfig: AuthConfig): Authenticator {
+  if (authConfig.kind === "tokens") return new TokenAuthenticator(authConfig.tokens);
+  logger.warn("auth.disabled", { hint: "AUTH=none: anyone who can reach the port can use the agent" });
+  return new NoAuthenticator();
+}
 
 function createLLMProvider(llmConfig: LLMConfig): LLMProvider {
   switch (llmConfig.provider) {

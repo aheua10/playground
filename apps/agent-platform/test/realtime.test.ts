@@ -12,7 +12,7 @@ import { StubLLMProvider } from "../src/llm/stub-llm-provider.ts";
 import { AgentRuntime } from "../src/runtime/agent-runtime.ts";
 import { ToolExecutor } from "../src/tools/tool-executor.ts";
 import { ToolRegistry } from "../src/tools/tool-registry.ts";
-import { captureLogger, eventually } from "./helpers.ts";
+import { bearer, captureLogger, eventually, testAuthenticator } from "./helpers.ts";
 
 const ALLOWED_ORIGIN = "http://localhost:3000";
 
@@ -35,8 +35,16 @@ async function startServer(t: TestContext, llm: LLMProvider = new StubLLMProvide
   const toolExecutor = new ToolExecutor({ registry: new ToolRegistry() });
   const runtime = new AgentRuntime({ llm, store: new InMemoryConversationStore(), toolExecutor, logger, events });
   const allowedHosts: string[] = [];
-  const server = createHttpServer({ runtime, tasks: { list: async () => [] }, logger, allowedHosts });
-  const realtime = attachRealtime(server, { runtime, events, logger, allowedHosts, allowedOrigins: [ALLOWED_ORIGIN] });
+  const authenticator = testAuthenticator();
+  const server = createHttpServer({ runtime, tasks: { list: async () => [] }, logger, authenticator, allowedHosts });
+  const realtime = attachRealtime(server, {
+    runtime,
+    events,
+    logger,
+    authenticator,
+    allowedHosts,
+    allowedOrigins: [ALLOWED_ORIGIN],
+  });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(() => {
@@ -49,9 +57,9 @@ async function startServer(t: TestContext, llm: LLMProvider = new StubLLMProvide
 
 type Received = { type: string; [key: string]: unknown };
 
-/** A WebSocket client (Node's built-in) that records what it receives. */
-async function connect(t: TestContext, base: string, conversationId = "c1") {
-  const ws = new WebSocket(`ws://${base}/realtime?conversationId=${conversationId}`);
+/** A WebSocket client (Node's built-in, which can send headers) that records what it receives. */
+async function connect(t: TestContext, base: string, conversationId = "c1", user: "alice" | "bob" = "alice") {
+  const ws = new WebSocket(`ws://${base}/realtime?conversationId=${conversationId}`, { headers: bearer(user) });
   const received: Received[] = [];
   ws.addEventListener("message", (event) => received.push(JSON.parse(String(event.data))));
   await once(ws, "open");
@@ -74,6 +82,7 @@ function handshake(base: string, path: string, headers: Record<string, string> =
         upgrade: "websocket",
         "sec-websocket-version": "13",
         "sec-websocket-key": Buffer.from("0123456789abcdef").toString("base64"),
+        ...bearer("alice"),
         ...headers,
       },
     });
@@ -111,7 +120,7 @@ test("turns started elsewhere (REST) reach every socket on the conversation, and
 
   const response = await fetch(`http://${base}/messages`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...bearer("alice") },
     body: JSON.stringify({ conversationId: "c1", message: "from curl" }),
   });
   const { turnId } = (await response.json()) as { turnId: string };
@@ -173,12 +182,12 @@ test("an oversized frame closes the connection", async (t) => {
   const client = await connect(t, base);
 
   client.send({ type: "message", text: "x".repeat(70_000) });
-  const [event] = (await once(client.ws, "close")) as [CloseEvent];
+  const [event] = (await once(client.ws, "close")) as [{ code: number }];
 
   assert.equal(event.code, 1009); // message too big
 });
 
-test("the handshake checks Host, path, Origin and conversationId", async (t) => {
+test("the handshake checks Host, path, Origin, token and conversationId", async (t) => {
   const { base, lines } = await startServer(t);
 
   assert.equal(await handshake(base, "/realtime?conversationId=c1", { origin: ALLOWED_ORIGIN }), 101);
@@ -191,5 +200,23 @@ test("the handshake checks Host, path, Origin and conversationId", async (t) => 
   // DNS rebinding: the page's own origin is allowed by the Origin check, but the Host gives it away.
   const rebound = { host: "evil.example:3000", origin: "http://evil.example:3000" };
   assert.equal(await handshake(base, "/realtime?conversationId=c1", rebound), 403);
-  assert.equal(lines.filter((line) => line.event === "realtime.rejected").length, 6);
+  assert.equal(await handshake(base, "/realtime?conversationId=c1", { authorization: "" }), 401);
+  assert.equal(await handshake(base, "/realtime?conversationId=c1", { authorization: "Bearer ap_nope" }), 401);
+  assert.equal(lines.filter((line) => line.event === "realtime.rejected").length, 8);
+});
+
+test("a socket only sees its own user's conversation, under the id the client chose", async (t) => {
+  const { base } = await startServer(t);
+  const alice = await connect(t, base, "c1", "alice");
+  const bob = await connect(t, base, "c1", "bob");
+
+  alice.send({ type: "message", text: "for alice only" });
+  const completed = await alice.waitFor("turn.completed");
+  bob.send({ type: "message", text: "for bob only" });
+  await bob.waitFor("turn.completed");
+
+  assert.equal(completed.conversationId, "c1", "the client's id, not the internal alice/c1");
+  assert.ok(alice.received.every((m) => !JSON.stringify(m).includes("for bob only")));
+  assert.ok(bob.received.every((m) => !JSON.stringify(m).includes("for alice only")));
+  assert.match(String((await bob.waitFor("turn.completed")).reply), /context: 1 messages/);
 });

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
+import { type Authenticator, bearerToken, type Principal, scopeConversationId } from "../auth/authenticator.ts";
 import type { ConversationEvent, ConversationEvents } from "../events/conversation-events.ts";
 import type { Logger } from "../logger.ts";
 import type { AgentRuntime } from "../runtime/agent-runtime.ts";
@@ -22,12 +23,15 @@ import { CONVERSATION_ID_PATTERN, MAX_MESSAGE_CHARS } from "./input-rules.ts";
 //                      every ConversationEvent of the conversation (turn.*, reply.delta, tool.*, task.updated)
 //                      { "type": "error", "message": "..." }     a client message was rejected
 //
-// Who may connect: browsers don't apply CORS to WebSockets, so without a check
-// any web page open in the user's browser could connect to localhost and drive
-// the agent. The handshake's Origin header must therefore be on an allowlist.
-// Clients that aren't browsers (the CLI) send no Origin and are let through:
-// this check stops other websites, it is not authentication. The Host header
-// is checked first, as for every REST request (host-check.ts).
+// Who may connect, checked on the handshake, before the upgrade:
+//   - Host must name this server, as for every REST request (host-check.ts).
+//   - Origin must be on an allowlist: browsers don't apply CORS to WebSockets,
+//     so otherwise any web page open in the user's browser could connect.
+//     Clients that aren't browsers (the CLI) send no Origin.
+//   - A bearer token, like REST ("Authorization: Bearer <token>"). The socket
+//     then belongs to that principal, and its conversation id is scoped to it.
+//     (Browsers can't set headers on a WebSocket handshake; a browser UI will
+//     need a sign-in that sets a cookie, or a short-lived ticket in the URL.)
 
 const PATH = "/realtime";
 /** A client message is a small JSON object; anything bigger closes the socket (1009). */
@@ -42,6 +46,7 @@ export interface RealtimeDeps {
   runtime: Pick<AgentRuntime, "runTurn">;
   events: Pick<ConversationEvents, "subscribe">;
   logger: Logger;
+  authenticator: Authenticator;
   /** Host names allowed besides localhost and IP addresses (ALLOWED_HOSTS). */
   allowedHosts: readonly string[];
   /** Origins (scheme://host:port) whose pages may connect. */
@@ -67,16 +72,19 @@ export function attachRealtime(server: Server, deps: RealtimeDeps): Realtime {
     const url = new URL(req.url ?? "/", "http://localhost");
     const conversationId = url.searchParams.get("conversationId") ?? "";
     const origin = req.headers.origin;
+    const principal = deps.authenticator.authenticate(bearerToken(req.headers.authorization));
 
     let refusal: [status: number, reason: string] | undefined;
     if (!isAllowedHost(req.headers.host, allowedHosts)) refusal = [403, "Forbidden"];
     else if (url.pathname !== PATH) refusal = [404, "Not Found"];
     else if (origin !== undefined && !allowedOrigins.has(origin)) refusal = [403, "Forbidden"];
+    else if (!principal) refusal = [401, "Unauthorized"];
     else if (!CONVERSATION_ID_PATTERN.test(conversationId)) refusal = [400, "Bad Request"];
-    if (refusal) {
-      const [status, reason] = refusal;
+    if (refusal || !principal) {
+      const [status, reason] = refusal ?? [401, "Unauthorized"];
+      const challenge = status === 401 ? "WWW-Authenticate: Bearer\r\n" : "";
       deps.logger.warn("realtime.rejected", { path: url.pathname, status, host: req.headers.host, origin });
-      socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      socket.end(`HTTP/1.1 ${status} ${reason}\r\n${challenge}Connection: close\r\nContent-Length: 0\r\n\r\n`);
       return;
     }
 
@@ -84,7 +92,7 @@ export function attachRealtime(server: Server, deps: RealtimeDeps): Realtime {
       socket.removeListener("error", onSocketError);
       alive.add(ws);
       ws.on("pong", () => alive.add(ws));
-      serve(ws, conversationId, deps);
+      serve(ws, principal, conversationId, deps);
     });
   });
 
@@ -111,8 +119,11 @@ export function attachRealtime(server: Server, deps: RealtimeDeps): Realtime {
   };
 }
 
-function serve(ws: WebSocket, conversationId: string, deps: RealtimeDeps): void {
-  const log = deps.logger.child({ conversationId, connectionId: randomUUID() });
+function serve(ws: WebSocket, principal: Principal, conversationId: string, deps: RealtimeDeps): void {
+  // Inside, the conversation is the principal's (see scopeConversationId); on
+  // the wire it keeps the id the client chose.
+  const scopedId = scopeConversationId(principal, conversationId);
+  const log = deps.logger.child({ conversationId: scopedId, connectionId: randomUUID() });
   const inFlight = new Set<AbortController>();
   log.info("realtime.connected");
 
@@ -126,7 +137,7 @@ function serve(ws: WebSocket, conversationId: string, deps: RealtimeDeps): void 
     ws.send(JSON.stringify(message));
   };
 
-  const unsubscribe = deps.events.subscribe(conversationId, send);
+  const unsubscribe = deps.events.subscribe(scopedId, (event) => send({ ...event, conversationId }));
   send({ type: "ready", conversationId });
 
   ws.on("message", (data: RawData, isBinary: boolean) => {
@@ -153,7 +164,7 @@ function serve(ws: WebSocket, conversationId: string, deps: RealtimeDeps): void 
     // The outcome reaches the client as events (turn.completed / turn.failed),
     // so nothing is sent here, and failures are already logged by the runtime.
     deps.runtime
-      .runTurn({ conversationId, text: request.text }, controller.signal)
+      .runTurn({ conversationId: scopedId, text: request.text }, controller.signal)
       .catch(() => {})
       .finally(() => inFlight.delete(controller));
   });
