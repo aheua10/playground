@@ -19,7 +19,14 @@ export type SandboxConfig = { kind: "none" } | { kind: "docker"; image: string; 
 
 export type TaskWorkerConfig =
   | { kind: "simulated" }
-  | { kind: "coding"; workspacesDir: string; sandbox: SandboxConfig; repositories: Repository[] };
+  | {
+      kind: "coding";
+      workspacesDir: string;
+      sandbox: SandboxConfig;
+      repositories: Repository[];
+      /** Whether publish_task may push task branches to their remotes. */
+      allowGitPush: boolean;
+    };
 
 export interface Config {
   port: number;
@@ -54,6 +61,7 @@ function loadWorkerConfig(env: NodeJS.ProcessEnv): TaskWorkerConfig {
     kind,
     workspacesDir: path.resolve(env.WORKSPACES_DIR ?? "./workspaces"),
     repositories: parseRepositories(env.REPOSITORIES),
+    allowGitPush: parseOneOf("ALLOW_GIT_PUSH", env.ALLOW_GIT_PUSH ?? "false", ["true", "false"]) === "true",
     sandbox:
       sandbox === "none"
         ? { kind: "none" }

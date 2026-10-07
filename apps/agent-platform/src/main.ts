@@ -6,6 +6,7 @@ import type { LLMProvider } from "./llm/llm-provider.ts";
 import { StubLLMProvider } from "./llm/stub-llm-provider.ts";
 import { createLogger, type Logger } from "./logger.ts";
 import { tokenAuth } from "./repositories/git.ts";
+import { createPublishTaskTool } from "./repositories/publish-task-tool.ts";
 import { RepositoryCatalog } from "./repositories/repository-catalog.ts";
 import { AgentRuntime } from "./runtime/agent-runtime.ts";
 import type { CommandSandbox } from "./sandbox/command-sandbox.ts";
@@ -38,6 +39,10 @@ const tasks = new TaskManager({ store: new InMemoryTaskStore(), worker, logger }
 const toolRegistry = new ToolRegistry();
 toolRegistry.register(createGetCurrentTimeTool());
 for (const tool of createTaskTools(tasks, { repositories: repositories.names() })) toolRegistry.register(tool);
+if (config.worker.kind === "coding" && config.worker.allowGitPush) {
+  const { workspacesDir } = config.worker;
+  toolRegistry.register(createPublishTaskTool({ tasks, repositories, workspacesDir, gitAuth, logger }));
+}
 
 const store = new InMemoryConversationStore();
 const toolExecutor = new ToolExecutor({ registry: toolRegistry });
@@ -55,6 +60,7 @@ server.listen(config.port, () => {
     workspacesDir: config.worker.kind === "coding" ? config.worker.workspacesDir : undefined,
     sandbox: config.worker.kind === "coding" ? config.worker.sandbox.kind : undefined,
     repositories: repositories.names(),
+    gitPush: config.worker.kind === "coding" && config.worker.allowGitPush,
   });
 });
 

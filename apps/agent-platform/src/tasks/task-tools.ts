@@ -9,7 +9,7 @@ import { TaskError, type TaskManager } from "./task-manager.ts";
 // injection) can only ever reach tasks of the conversation it is running in,
 // and `additionalProperties: false` rejects any attempt to pass one anyway.
 
-const TASK_ID = { type: "string", pattern: "^task_[a-z0-9]+$", description: "The task id, e.g. task_3f2a9c01b4" };
+export const TASK_ID_SCHEMA = { type: "string", pattern: "^task_[a-z0-9]+$", description: "The task id, e.g. task_3f2a9c01b4" };
 
 export interface TaskToolOptions {
   /** Names of the repositories tasks may work on (the operator's allowlist). */
@@ -71,7 +71,7 @@ export function createTaskTools(tasks: TaskManager, options: TaskToolOptions = {
         "asks how a task is going or what it produced.",
       inputSchema: {
         type: "object",
-        properties: { taskId: TASK_ID },
+        properties: { taskId: TASK_ID_SCHEMA },
         required: ["taskId"],
         additionalProperties: false,
       },
@@ -101,7 +101,7 @@ export function createTaskTools(tasks: TaskManager, options: TaskToolOptions = {
       inputSchema: {
         type: "object",
         properties: {
-          taskId: TASK_ID,
+          taskId: TASK_ID_SCHEMA,
           change: { type: "string", minLength: 1, maxLength: 4000, description: "The new or changed requirement." },
         },
         required: ["taskId", "change"],
@@ -118,7 +118,7 @@ export function createTaskTools(tasks: TaskManager, options: TaskToolOptions = {
       description: "Stops a running task for good. Use when the user asks to stop or cancel work.",
       inputSchema: {
         type: "object",
-        properties: { taskId: TASK_ID },
+        properties: { taskId: TASK_ID_SCHEMA },
         required: ["taskId"],
         additionalProperties: false,
       },
