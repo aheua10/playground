@@ -1,6 +1,8 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { TokenAuthenticator } from "../src/auth/authenticator.ts";
+import { hashToken } from "../src/auth/tokens.ts";
 import type { ToolCall } from "../src/core/messages.ts";
 import type { LLMProvider, LLMRequest, LLMResponse } from "../src/llm/llm-provider.ts";
 import { createLogger, type LogFields } from "../src/logger.ts";
@@ -104,4 +106,17 @@ export async function createRemote(): Promise<{ repository: Repository; remoteDi
   await git(["commit", "--quiet", "-m", "Initial commit"], { cwd: seed, config: AUTHOR });
   await git(["push", "--quiet", remoteDir, "main"], { cwd: seed });
   return { repository: { name: "project", url: `file://${remoteDir}` }, remoteDir };
+}
+
+/** Two users with one token each, for transport tests. */
+export const TOKENS = { alice: "ap_test-token-alice", bob: "ap_test-token-bob" } as const;
+
+export function testAuthenticator(): TokenAuthenticator {
+  return new TokenAuthenticator(
+    Object.entries(TOKENS).map(([principal, token]) => ({ principal, tokenHash: hashToken(token) })),
+  );
+}
+
+export function bearer(user: keyof typeof TOKENS): { authorization: string } {
+  return { authorization: `Bearer ${TOKENS[user]}` };
 }

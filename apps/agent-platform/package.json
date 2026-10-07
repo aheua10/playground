@@ -13,7 +13,8 @@
     "start": "node --enable-source-maps dist/main.js",
     "typecheck": "tsc --noEmit",
     "test": "node --test \"test/**/*.test.ts\"",
-    "chat": "node scripts/chat.ts"
+    "chat": "node scripts/chat.ts",
+    "create-token": "node scripts/create-token.ts"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

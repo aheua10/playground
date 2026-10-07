@@ -4,7 +4,7 @@ A learning project: an agent runtime built without an agent framework, so the
 agent loop, the tool trust boundary, and the provider abstraction are all
 visible in our own code.
 
-**Status: Phase 5 complete.**
+**Status: Phase 5 complete, plus authentication and persistence.**
 - **Phase 1:** conversations over HTTP, an explicit agent loop, a native tool
   (`get_current_time`) behind a trust boundary, and two LLM providers: a
   deterministic stub (default, no API key) and Anthropic (Claude).
@@ -17,8 +17,12 @@ visible in our own code.
 - **Phase 5:** a realtime channel. A WebSocket streams replies, tool calls
   and task updates as they happen, and the agent speaks up on its own when a
   task finishes.
+- **Authentication:** bearer tokens per user, and conversations (with their
+  tasks) private to their user.
+- **Persistence:** conversations and tasks live in a SQLite file, so they
+  survive restarts and crashes.
 
-Not yet: MCP, persistence, authentication, voice. Deploying: see
+Not yet: MCP, voice. Deploying: see
 [DEPLOY.md](DEPLOY.md).
 
 ## Run it
@@ -27,11 +31,20 @@ Requires Node.js >= 22.18 (runs TypeScript directly via built-in type stripping)
 
 ```sh
 npm install
-cp .env.example .env   # optional: pick the LLM provider here
-npm run dev            # node --watch, pretty logs in a terminal
-npm test               # node:test, no test framework dependency
+cp .env.example .env              # pick the LLM provider etc. here
+npm run create-token -- me        # prints a token, and an AUTH_TOKENS=... line for .env
+#   put the AUTH_TOKENS line in .env, and keep the token for yourself:
+export AGENT_TOKEN=ap_...
+npm run dev                       # node --watch, pretty logs in a terminal
+npm test                          # node:test, no test framework dependency
 npm run typecheck
 ```
+
+Without `AUTH_TOKENS` the server refuses to start. On a machine only you can
+reach, `AUTH=none` in `.env` switches authentication off instead.
+Conversations and tasks are kept in `./data/agent-platform.db`
+(`STORE=memory` for a throwaway run). Node prints an `ExperimentalWarning`
+for SQLite at startup; see [Persistence](#persistence).
 
 Or with Docker (reads the same `.env`):
 
@@ -42,21 +55,22 @@ docker compose up --build
 Then talk to it:
 
 ```sh
-say() { curl -s -X POST localhost:3000/messages -H 'content-type: application/json' \
-          -d "{\"conversationId\":\"demo\",\"message\":\"$1\"}"; echo; }
+api() { curl -s -H "Authorization: Bearer $AGENT_TOKEN" "$@"; echo; }
+say() { api -X POST localhost:3000/messages -H 'content-type: application/json' \
+          -d "{\"conversationId\":\"demo\",\"message\":\"$1\"}"; }
 
 say "What time is it in Asia/Tokyo?"
 say "Create a TypeScript server for this project."   # returns at once: task started
 say "Use Fastify instead of Express."                # revises the running task
 say "What is the status?"
-curl -s localhost:3000/conversations/demo/tasks      # progress, result, workspace path
-curl -s localhost:3000/conversations/demo            # the stored turns, with tool calls and results
+api localhost:3000/conversations/demo/tasks          # progress, result, workspace path
+api localhost:3000/conversations/demo                # the stored turns, with tool calls and results
 ```
 
 Or chat in a terminal, with replies streaming in as they're written:
 
 ```sh
-npm run chat              # a new conversation
+npm run chat              # a new conversation (uses AGENT_TOKEN)
 npm run chat -- demo      # join "demo": turns sent with curl above show up here too
 ```
 
@@ -72,6 +86,10 @@ the coding worker it only writes a `NOTES.md` (and runs one command with
 | `ANTHROPIC_API_KEY` | (required for `anthropic`)     |                                         |
 | `ANTHROPIC_MODEL`   | `claude-opus-5-5`              | any Claude model id                     |
 | `ANTHROPIC_EFFORT`  | `medium`                       | `low` `medium` `high` `xhigh` `max`     |
+| `AUTH`              | `tokens`                       | `tokens` `none`                         |
+| `AUTH_TOKENS`       | (required for `tokens`)        | `name:sha256hex`, comma-separated, from `npm run create-token` |
+| `STORE`             | `sqlite`                       | `sqlite` `memory` (lost on restart)     |
+| `DATABASE_PATH`     | `./data/agent-platform.db`     | the SQLite file (`/data/agent-platform.db` in the image) |
 | `PORT`              | `3000`                         | 1-65535                                 |
 | `LOG_LEVEL`         | `info`                         | `debug` `info` `warn` `error`           |
 | `LOG_FORMAT`        | `pretty` on a TTY, else `json` | `pretty` `json`                         |
@@ -96,11 +114,12 @@ prompt, tool definitions, messages): exactly what the model is told.
 | `POST /messages`          | `{ conversationId, message }` → `{ conversationId, turnId, reply }` |
 | `GET /conversations/:id`  | stored history, including tool calls and results (debugging)   |
 | `GET /conversations/:id/tasks` | the conversation's background tasks and their state       |
-| `GET /health`             | liveness check                                                 |
+| `GET /health`             | liveness check (the only route without a token)                |
 | `GET /realtime?conversationId=…` | WebSocket upgrade: the [realtime channel](#the-realtime-channel) |
 
-If the client disconnects mid-turn, the turn is cancelled (LLM call and tools
-aborted) and nothing is persisted.
+Every route except `/health` needs `Authorization: Bearer <token>` (see
+[Authentication](#authentication)). If the client disconnects mid-turn, the
+turn is cancelled (LLM call and tools aborted) and nothing is persisted.
 
 **Every request must be addressed to this server** (`src/http/host-check.ts`):
 its `Host` header must be `localhost`, an IP address, or a name in
@@ -110,6 +129,41 @@ its requests then reach the agent through your tunnel as same-origin, so CORS
 doesn't apply. They still carry `Host: evil.example`. No other site can make
 your browser send `Host: localhost` or an IP address, so those are always
 allowed.
+
+## Authentication
+
+```
+request ─► Host allowed? ─► bearer token ─► Authenticator ─► Principal { id: "alice" }
+               403               401                             │
+                                       conversationId "demo" ─► "alice/demo" everywhere inside
+```
+
+- **Tokens.** `npm run create-token -- <name>` prints a random token
+  (`ap_` + 32 random bytes) and the entry `name:sha256(token)` for
+  `AUTH_TOKENS`. The server stores only hashes, so its `.env`, a config dump
+  or a log can't be replayed to get in. (SHA-256 rather than bcrypt: slow
+  hashes protect guessable passwords; a 256-bit random token can't be
+  guessed.) Create tokens on your own machine; the token itself never needs
+  to exist on the server.
+- **Several tokens per user** (one per device, or old and new while rotating):
+  list each. Revoking one means removing its entry and restarting.
+- **Who you are decides what you see.** Each user's conversation ids live in
+  their own namespace: alice's `demo` is stored as `alice/demo`, bob's as
+  `bob/demo`. History, tasks, events and turn locks are all keyed by that id,
+  so isolation holds by construction; there is no ownership check that a new
+  route could forget. Bob gets 404 for alice's conversation, and a fresh
+  conversation of his own if he writes to the same id. Clients keep seeing
+  their own ids.
+- **Both transports**, the same way: REST and the WebSocket handshake read
+  the `Authorization` header (Node's WebSocket client can send it; the chat
+  client uses `AGENT_TOKEN`). Missing or unknown tokens get 401 before any
+  routing, so routes can't be probed. A browser UI can't set headers on a
+  WebSocket; it will need a sign-in that sets a cookie, or a short-lived
+  ticket.
+- **Pluggable.** Transports only call `Authenticator.authenticate(token)`. An
+  OIDC/JWT authenticator for real sign-in would be another implementation.
+- **`AUTH=none`** makes everyone the user `local`, and logs `auth.disabled` at
+  startup. Only for a machine nobody else can reach.
 
 ## The agent loop
 
@@ -327,11 +381,45 @@ REST, sockets, notices: every turn publishes the same events
   and drive the agent. The handshake must pass the same `Host` check as REST,
   and its `Origin` must be in `ALLOWED_ORIGINS`. Clients that aren't browsers
   (curl, `npm run chat`) send no `Origin` and are allowed. These checks keep
-  other websites out; they are not authentication.
+  other websites out; then, as for REST, the handshake needs a valid bearer
+  token, and the socket can only reach its own user's conversation.
 - **Limits.** 64 KiB per frame (bigger closes the socket with 1009), the same
   text limit as REST, 3 turns in flight per socket, 1 MiB of unsent output
   before a slow client is dropped, and a 30 s ping that drops dead
   connections. Closing a socket cancels its turns.
+
+## Persistence
+
+```
+SQLite file (DATABASE_PATH)            ◄── SqliteConversationStore, SqliteTaskStore
+  messages  one row per message, JSON       (ConversationStore / TaskStore interfaces)
+  tasks     the Task as JSON + lookup columns
+WORKSPACES_DIR                         ◄── task files and git directories (as before)
+in memory only                             live events, turn locks, running attempts
+```
+
+- **Why SQLite.** One instance, so the store can be a library rather than a
+  server: no extra container, port or password, the whole state is one file,
+  and Node ships it (`node:sqlite`), so it's not even a dependency. Node
+  still marks it experimental and prints a warning at startup. Postgres
+  would be one more implementation of the same two store interfaces, for
+  when several instances must share state.
+- **Messages are stored exactly as produced**, as JSON, including the
+  provider's `raw` data: Anthropic's signed thinking blocks are replayed byte
+  for byte after a restart. A turn's messages go in one transaction, so a
+  turn is still all or nothing.
+- **A crash can't leave a task "running" forever.** At startup, before
+  accepting requests, tasks still marked running are failed as interrupted
+  (`task.failed`, `recovered=true`; published as `interrupted`, so no notice
+  turn). A clean shutdown records them itself. Revising one starts a new
+  attempt on the same workspace.
+- **Schema changes are numbered migrations** in `persistence/database.ts`,
+  applied at startup and recorded in SQLite's `user_version`. A database
+  written by newer code is refused rather than risked.
+- **Durability and privacy.** WAL mode: a crash or power loss can lose the
+  last commits, but never corrupts the file. The file is created `0600` in a
+  `0700` directory, since conversations hold whatever users and models wrote.
+  To back it up, copy it while the agent is stopped.
 
 ## Layout and dependency direction
 
@@ -340,6 +428,9 @@ src/
   main.ts                    composition root: the only place concrete classes are chosen
   config.ts                  env vars -> typed config, fail fast
   logger.ts                  structured logger (event name + fields)
+  auth/
+    tokens.ts                token generation and hashing
+    authenticator.ts         Authenticator, Principal, per-user conversation scoping
   http/
     server.ts                HTTP transport adapter (node:http)
     realtime.ts              WebSocket transport (/realtime): events out, messages in
@@ -357,9 +448,13 @@ src/
     task-worker.ts           TaskWorker contract
     coding-worker.ts         the worker agent: agent loop + workspace tools + sandbox
     simulated-coding-worker.ts  stand-in worker (no code is written)
-    task-store.ts            async store interface + in-memory impl
+    task-store.ts            TaskStore interface + in-memory impl
     task-tools.ts            the five tools the agent uses to drive tasks
     task-notifier.ts         announces finished tasks through platform-started turns
+  persistence/
+    database.ts              opens the SQLite file: pragmas, permissions, migrations
+    sqlite-conversation-store.ts  ConversationStore on SQLite
+    sqlite-task-store.ts     TaskStore on SQLite
   tools/
     tool.ts                  Tool contract + ToolError
     tool-registry.ts         which tools exist; schema compilation
@@ -370,7 +465,7 @@ src/
     llm-provider.ts          the provider boundary
     anthropic-provider.ts    Claude via the Anthropic SDK (the only file that knows its format)
     stub-llm-provider.ts     deterministic fake that speaks tool calls
-  conversation/              async, append-only store interface + in-memory impl
+  conversation/              ConversationStore interface (async, append-only) + in-memory impl
   sandbox/
     workspace.ts             the filesystem boundary
     workspace-tools.ts       list/read/write/delete_file
@@ -382,15 +477,17 @@ src/
     task-checkout.ts         clone / commit / push, git dir outside the sandbox
     publish-task-tool.ts     publish_task
   core/                      provider-neutral messages, tool definitions, KeyedMutex
-scripts/chat.ts              terminal client for the realtime channel (no dependencies)
+scripts/
+  chat.ts                    terminal client for the realtime channel (no dependencies)
+  create-token.ts            prints a new API token and its AUTH_TOKENS entry
 ```
 
 ```
 http, realtime ──► runtime ──► LLMProvider (interface)      ◄── anthropic, stub
                         ├────► ToolExecutor ──► ToolRegistry ◄── native tools, task tools (later: MCP tools)
-                        │                                          └─► TaskManager ──► TaskWorker, TaskStore
+                        │                                          └─► TaskManager ──► TaskWorker, TaskStore ◄── sqlite, in-memory
                         │                                                               └─ CodingWorker ─► runAgentLoop, Workspace, CommandSandbox, TaskCheckout
-                        └────► ConversationStore (interface) ◄── in-memory
+                        └────► ConversationStore (interface) ◄── sqlite, in-memory
 runtime, TaskManager ──► ConversationEvents ◄── realtime, TaskNotifier (subscribers)
 everything ──► core/
 ```
@@ -421,16 +518,17 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
 | `task.progress`       | worker progress note                                       |
 | `task.revised`        | requirement added; new attempt launched                    |
 | `task.completed`      | worker finished; result stored                             |
-| `task.failed`         | worker failed, or interrupted by shutdown                  |
+| `task.failed`         | worker failed, interrupted by shutdown, or found interrupted at startup (`recovered=true`) |
 | `task.cancelled`      | stopped on request                                         |
 | `task.stale_update_dropped` | debug: late result from a superseded attempt ignored |
 | `worker.started`      | a coding worker attempt began (workspace path); its own `llm.*`/`tool.*` lines carry `taskId`, `attempt`, `agent=coding-worker` |
 | `sandbox.runs_as_root`| warning: sandboxed commands would run as uid 0              |
 | `git.cloned` / `git.committed` / `git.pushed` | repository checkout, per-attempt commit, publish (repository, branch, commit) |
 | `git.clone_failed` / `git.push_failed` | clone or push failed (details in the log, a short reason to the model) |
-| `http.rejected`       | 4xx: client input refused at the transport (including a `Host` that isn't allowed) |
+| `http.rejected`       | 4xx: refused at the transport (bad input, `Host` not allowed, 401 without a valid token); carries `principal` once known |
+| `auth.disabled`       | warning at startup: `AUTH=none`                            |
 | `realtime.connected` / `realtime.disconnected` | a WebSocket opened / closed (`connectionId`; turns cancelled by the close) |
-| `realtime.rejected`   | handshake refused (`Host` or `Origin` not allowed, wrong path, bad conversationId) |
+| `realtime.rejected`   | handshake refused (`Host` or `Origin` not allowed, wrong path, 401, bad conversationId) |
 | `realtime.invalid_message` | a client message was rejected (sent back as `error`)  |
 | `realtime.cancel_turn` | the client cancelled its turns                            |
 | `realtime.slow_client` | dropped: too much unsent output                           |
@@ -447,24 +545,26 @@ Tool lines add `toolCallId` and `tool`; task lines carry `conversationId`,
   tool list is sorted, and history is append-only. That keeps prompt caching
   effective and satisfies Anthropic's check that the history before a
   thinking block is unchanged. Dynamic facts like the time come from tools.
-- **Turns are all-or-nothing.** A failed or cancelled turn persists nothing.
+- **Turns are all-or-nothing.** A failed or cancelled turn persists nothing,
+  and a completed one is stored in a single transaction.
   Tool side effects are not rolled back, so the `tool.*` logs are the audit trail.
 
 ## Known limitations (intentional for now)
 
-- Conversations and tasks are in memory: lost on restart, so run a single
-  instance. On SIGTERM, running tasks are recorded as interrupted first.
-- Task work runs inside the server process. At scale it moves to a queue and
-  separate workers; `TaskManager` keeps its interface.
-- The event bus is in-process: a second instance wouldn't see the first's
-  events. Several instances need a shared bus or per-conversation routing.
+- One instance only. The database is a local file, and the event bus, turn
+  locks and running attempts are in-process. Several instances need Postgres
+  (the same two store interfaces), a shared bus, and work handed to a queue.
+- A task that was running when the server stopped is not resumed: it is
+  recorded as interrupted, and revising it starts a new attempt.
 - A finished task costs one LLM call for its notice, whether or not anyone is
   connected; the reply waits in the history.
 - Workspaces and checkouts are never cleaned up. Each task clones the whole
   base branch; submodules and Git LFS aren't supported.
-- The HTTP API has no authentication: keep it private (see DEPLOY.md). The
-  `Host` and `Origin` checks keep other websites out, but anyone who can
-  reach the port directly can use it.
+- Tokens don't expire, and revoking one needs a restart. Every user has the
+  same tools and repositories: there are no per-user permissions yet.
+- The API speaks plain HTTP, so a token is only as private as the network it
+  crosses. Keep the port private (the SSM tunnel in DEPLOY.md) until there is
+  HTTPS in front.
 - An in-process tool that ignores its abort signal keeps running after a
   timeout; the runtime just stops waiting. (Sandboxed commands don't have
   this problem: their container is removed.)

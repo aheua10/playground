@@ -1,4 +1,6 @@
 import path from "node:path";
+import type { TokenEntry } from "./auth/authenticator.ts";
+import { PRINCIPAL_ID_PATTERN, TOKEN_HASH_PATTERN } from "./auth/tokens.ts";
 import { hostnameOf } from "./http/host-check.ts";
 import type { Effort } from "./llm/anthropic-provider.ts";
 import { parseRepositories, type Repository } from "./repositories/repository-catalog.ts";
@@ -16,6 +18,12 @@ export type LLMConfig =
   | { provider: "stub" }
   | { provider: "anthropic"; model: string; effort: Effort };
 
+/** "tokens": every request needs a bearer token listed (as a hash) in AUTH_TOKENS. "none": no authentication. */
+export type AuthConfig = { kind: "tokens"; tokens: TokenEntry[] } | { kind: "none" };
+
+/** Where conversations and tasks are kept. "memory": lost on restart (tests, throwaway runs). */
+export type StoreConfig = { kind: "sqlite"; path: string } | { kind: "memory" };
+
 export type SandboxConfig = { kind: "none" } | { kind: "docker"; image: string; network: "none" | "bridge" };
 
 export type TaskWorkerConfig =
@@ -31,6 +39,8 @@ export type TaskWorkerConfig =
 
 export interface Config {
   port: number;
+  auth: AuthConfig;
+  store: StoreConfig;
   /** Host names, besides localhost and IP addresses, that requests may be addressed to. */
   allowedHosts: string[];
   /** Web origins whose pages may open the realtime WebSocket. */
@@ -45,6 +55,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const port = parsePort(env.PORT ?? "3000");
   return {
     port,
+    auth: loadAuthConfig(env),
+    store: loadStoreConfig(env),
     allowedHosts: parseHostnames(env.ALLOWED_HOSTS),
     allowedOrigins: parseOrigins(env.ALLOWED_ORIGINS, port),
     logLevel: parseOneOf("LOG_LEVEL", env.LOG_LEVEL ?? "info", ["debug", "info", "warn", "error"]),
@@ -107,6 +119,39 @@ function parsePort(raw: string): number {
     throw new Error(`Invalid PORT: "${raw}" (expected an integer 1-65535)`);
   }
   return port;
+}
+
+function loadStoreConfig(env: NodeJS.ProcessEnv): StoreConfig {
+  const kind = parseOneOf("STORE", env.STORE ?? "sqlite", ["sqlite", "memory"]);
+  if (kind === "memory") return { kind };
+  return { kind, path: path.resolve(env.DATABASE_PATH ?? "./data/agent-platform.db") };
+}
+
+// Secure by default: without tokens the server refuses to start, unless
+// authentication is switched off explicitly.
+function loadAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
+  const kind = parseOneOf("AUTH", env.AUTH ?? "tokens", ["tokens", "none"]);
+  if (kind === "none") return { kind };
+
+  const tokens = (env.AUTH_TOKENS ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [principal = "", tokenHash = "", ...rest] = entry.split(":");
+      if (!PRINCIPAL_ID_PATTERN.test(principal) || !TOKEN_HASH_PATTERN.test(tokenHash) || rest.length > 0) {
+        // Never echo the entry: it might be a token pasted in by mistake.
+        throw new Error("Invalid AUTH_TOKENS entry (expected name:sha256hex, as printed by `npm run create-token`)");
+      }
+      return { principal, tokenHash };
+    });
+  if (tokens.length === 0) {
+    throw new Error(
+      "AUTH_TOKENS is empty. Create a token with `npm run create-token -- <name>` and add the printed entry, " +
+        "or set AUTH=none on a machine only you can reach.",
+    );
+  }
+  return { kind, tokens };
 }
 
 // Names only: the port is never part of the check (see http/host-check.ts).

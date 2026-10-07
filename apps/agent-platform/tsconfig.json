@@ -7,6 +7,9 @@
   //   - verbatimModuleSyntax forces `import type` for type-only imports
   "compilerOptions": {
     "target": "es2024",
+    // Node only: no DOM types. Globals like fetch and WebSocket are typed as
+    // Node implements them (@types/node), e.g. WebSocket accepts headers.
+    "lib": ["es2024"],
     "module": "nodenext",
     "strict": true,
     "noUncheckedIndexedAccess": true,
