@@ -1,0 +1,22 @@
+{
+  // Type-checking config for src, test and scripts. `npm run typecheck` uses this.
+  // The source is written so Node can run it directly via built-in type
+  // stripping (`node src/main.ts`), which is why:
+  //   - relative imports use `.ts` extensions (rewritten to `.js` on build)
+  //   - erasableSyntaxOnly forbids enums/namespaces/parameter properties
+  //   - verbatimModuleSyntax forces `import type` for type-only imports
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "nodenext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "rewriteRelativeImportExtensions": true,
+    "types": ["node"],
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src", "test", "scripts"]
+}

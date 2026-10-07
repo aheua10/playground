@@ -1,0 +1,26 @@
+# Opt-in: let the coding worker run commands (run_command) in sandbox containers.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up --build
+#
+# Needs, on the Docker host:
+#   WORKSPACES_HOST_DIR  an absolute path owned by uid 1000 (the agent's user):
+#                          sudo mkdir -p /srv/agent-workspaces && sudo chown 1000:1000 /srv/agent-workspaces
+#   DOCKER_GID           the group owning the Docker socket:  stat -c %g /var/run/docker.sock
+#   the sandbox image    docker pull node:24-slim
+#
+# SECURITY: the Docker socket gives the agent container control of the host's
+# Docker daemon, which is root-equivalent on the host. That is acceptable only
+# because the agent's own code is trusted: model-written code still only runs
+# inside the locked-down sandbox containers. Use a machine dedicated to this.
+services:
+  agent-platform:
+    environment:
+      SANDBOX: docker
+      # Same path inside and outside: the agent passes this path to
+      # `docker run --mount`, and the daemon resolves it on the host.
+      WORKSPACES_DIR: ${WORKSPACES_HOST_DIR:?set WORKSPACES_HOST_DIR, see the header of this file}
+    group_add:
+      - ${DOCKER_GID:?set DOCKER_GID, see the header of this file}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${WORKSPACES_HOST_DIR}:${WORKSPACES_HOST_DIR}
