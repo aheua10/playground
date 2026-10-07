@@ -2,28 +2,20 @@ import { randomUUID } from "node:crypto";
 import type { ConversationStore } from "../conversation/conversation-store.ts";
 import { KeyedMutex } from "../core/keyed-mutex.ts";
 import type { Message } from "../core/messages.ts";
-import type { LLMProvider, StopReason } from "../llm/llm-provider.ts";
+import type { LLMProvider } from "../llm/llm-provider.ts";
 import type { Logger } from "../logger.ts";
 import type { ToolExecutor } from "../tools/tool-executor.ts";
+import { runAgentLoop } from "./agent-loop.ts";
 import { SYSTEM_PROMPT } from "./system-prompt.ts";
 
-// The agent runtime: transport-agnostic orchestration of one conversational
-// turn. It knows nothing about HTTP. REST today, and later a CLI, WebSocket or
-// voice layer, all call runTurn() with the same plain input.
+// The conversation agent: transport-agnostic orchestration of one
+// conversational turn. It knows nothing about HTTP. REST today, and later a
+// CLI, WebSocket or voice layer, all call runTurn() with the same plain input.
 //
 // A "turn" = one user message in, one final reply out. In between runs the
-// agent loop:
-//
-//   ┌─► LLM call (history + tool definitions)
-//   │     │
-//   │     ├─ no tool calls ──────────────► final reply, persist turn, return
-//   │     │
-//   │     └─ tool calls ─► ToolExecutor (exists? permitted? valid? bounded)
-//   │                        │
-//   └──── append results ◄───┘
-//
-// The LLM DECIDES which actions it wants. The runtime CONTROLS whether and how
-// they run (ToolExecutor), how many steps a turn may take, and what is saved.
+// shared agent loop (agent-loop.ts). What this class adds is conversation
+// state: it loads the history, serializes turns per conversation, and saves
+// the turn when it completes.
 //
 // Long-running work never happens inside a turn: tools like start_coding_task
 // hand it to the TaskManager and return at once, so turns stay short.
@@ -82,9 +74,27 @@ export class AgentRuntime {
     if (this.#turnLocks.isLocked(conversationId)) log.info("turn.waiting");
 
     try {
-      const result = await this.#turnLocks.run(conversationId, () => this.#runLoop(input, turnId, signal, log));
-      log.info("final.response", { reply: result.reply, durationMs: elapsed(turnStartedAt) });
-      return result;
+      const reply = await this.#turnLocks.run(conversationId, async () => {
+        const history = await this.#store.getMessages(conversationId);
+        const result = await runAgentLoop({
+          llm: this.#llm,
+          systemPrompt: SYSTEM_PROMPT,
+          toolExecutor: this.#toolExecutor,
+          history,
+          userMessage: { role: "user", content: input.text },
+          maxSteps: this.#maxSteps,
+          signal,
+          log,
+          conversationId,
+          turnId,
+        });
+        // Persisted only now, as a unit: a failed or cancelled turn leaves
+        // history untouched.
+        await this.#store.appendMessages(conversationId, result.messages);
+        return result.reply;
+      });
+      log.info("final.response", { reply, durationMs: elapsed(turnStartedAt) });
+      return { conversationId, turnId, reply };
     } catch (error) {
       if (signal.aborted) {
         log.warn("turn.cancelled", { durationMs: elapsed(turnStartedAt) });
@@ -95,71 +105,10 @@ export class AgentRuntime {
     }
   }
 
-  async #runLoop(input: TurnInput, turnId: string, signal: AbortSignal, log: Logger): Promise<TurnResult> {
-    const { conversationId } = input;
-    const history = await this.#store.getMessages(conversationId);
-    // Messages produced during this turn. Persisted together only when the
-    // turn completes, so a failed or cancelled turn leaves history untouched.
-    const turnMessages: Message[] = [{ role: "user", content: input.text }];
-
-    for (let step = 1; step <= this.#maxSteps; step++) {
-      signal.throwIfAborted(); // cancelled (or gone while waiting): don't start another LLM call
-      const stepLog = log.child({ step });
-      const messages = [...history, ...turnMessages];
-      const tools = this.#toolExecutor.definitions();
-
-      stepLog.info("llm.request", {
-        provider: this.#llm.name,
-        messageCount: messages.length,
-        tools: tools.map((tool) => tool.name),
-      });
-      stepLog.debug("llm.request.payload", { systemPrompt: SYSTEM_PROMPT, tools, messages });
-
-      const llmStartedAt = performance.now();
-      const response = await this.#llm.generate({ systemPrompt: SYSTEM_PROMPT, messages, tools, signal });
-      const { message, stopReason } = response;
-      stepLog.info("llm.response", {
-        model: response.model,
-        stopReason,
-        content: message.content,
-        toolCalls: message.toolCalls.map(({ id, name, input }) => ({ id, name, input })),
-        usage: response.usage,
-        durationMs: elapsed(llmStartedAt),
-      });
-      turnMessages.push(message);
-
-      // No tool calls: the model has given its final answer.
-      if (message.toolCalls.length === 0) {
-        await this.#store.appendMessages(conversationId, turnMessages);
-        return { conversationId, turnId, reply: message.content || fallbackReply(stopReason) };
-      }
-
-      // Tool calls in a truncated or refused response may be incomplete, so
-      // never run them.
-      if (stopReason !== "tool_use") {
-        throw new Error(`Model requested tools but stopped with "${stopReason}"`);
-      }
-
-      // Run the requested tools one at a time, in order. Sequential is the
-      // safe default once tools have side effects; parallelism can come later.
-      for (const call of message.toolCalls) {
-        turnMessages.push(await this.#toolExecutor.execute(call, { conversationId, turnId, signal, log: stepLog }));
-      }
-    }
-
-    throw new Error(`Turn exceeded the limit of ${this.#maxSteps} LLM calls`);
-  }
-
   /** Read-only view of a conversation, for inspection/debugging endpoints. */
   async getHistory(conversationId: string): Promise<Message[]> {
     return this.#store.getMessages(conversationId);
   }
-}
-
-function fallbackReply(stopReason: StopReason): string {
-  if (stopReason === "refusal") return "I can't help with that request.";
-  if (stopReason === "max_tokens") return "My reply was cut off before I could finish.";
-  return "";
 }
 
 function elapsed(startedAt: number): number {
