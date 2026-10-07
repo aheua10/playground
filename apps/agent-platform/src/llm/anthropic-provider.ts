@@ -6,24 +6,23 @@ import type { LLMProvider, LLMRequest, LLMResponse, StopReason } from "./llm-pro
 // LLMProvider backed by the Anthropic Messages API (Claude).
 //
 // The only file that knows the Anthropic wire format. It translates our neutral
-// request into exactly one `messages.create` call and the response back. The
-// SDK is used purely as a typed HTTP client (with retries on 429/5xx); its
+// request into exactly one streamed Messages API call and the response back.
+// The SDK is used purely as a typed HTTP client (with retries on 429/5xx); its
 // tool runner is deliberately NOT used, since the agent loop is ours.
+//
+// Every call streams, whether or not anyone listens to the text: one code path,
+// and long generations aren't bound by HTTP timeouts. The SDK assembles the
+// final message, so the response is the same as a non-streaming call's.
 
 export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
-
-type CreateMessage = (
-  params: Anthropic.Beta.Messages.MessageCreateParamsNonStreaming,
-  options: { signal?: AbortSignal },
-) => Promise<Anthropic.Beta.BetaMessage>;
 
 export interface AnthropicProviderOptions {
   model: string;
   /** How hard the model thinks before answering; trades quality for latency and cost. */
   effort: Effort;
   maxOutputTokens?: number;
-  /** Test seam. Defaults to the SDK client, which reads ANTHROPIC_API_KEY from the environment. */
-  createMessage?: CreateMessage;
+  /** Defaults to a client that reads ANTHROPIC_API_KEY from the environment. Tests pass one with a fake fetch. */
+  client?: Anthropic;
 }
 
 const PROVIDER = "anthropic";
@@ -33,23 +32,18 @@ export class AnthropicProvider implements LLMProvider {
   readonly #model: string;
   readonly #effort: Effort;
   readonly #maxOutputTokens: number;
-  readonly #createMessage: CreateMessage;
+  readonly #client: Anthropic;
 
   constructor(options: AnthropicProviderOptions) {
     this.#model = options.model;
     this.#effort = options.effort;
-    // Non-streaming request: ~16k keeps the call well inside HTTP timeouts.
+    // Room for a conversational reply or one coding step, thinking included.
     this.#maxOutputTokens = options.maxOutputTokens ?? 16_000;
-    if (options.createMessage) {
-      this.#createMessage = options.createMessage;
-    } else {
-      const client = new Anthropic();
-      this.#createMessage = (params, requestOptions) => client.beta.messages.create(params, requestOptions);
-    }
+    this.#client = options.client ?? new Anthropic();
   }
 
   async generate(request: LLMRequest): Promise<LLMResponse> {
-    const response = await this.#createMessage(
+    const stream = this.#client.beta.messages.stream(
       {
         model: this.#model,
         max_tokens: this.#maxOutputTokens,
@@ -68,7 +62,14 @@ export class AnthropicProvider implements LLMProvider {
       },
       { signal: request.signal },
     );
-    return fromAnthropicResponse(response);
+    // Reply text only. Tool-call arguments are streamed too, but they are acted
+    // on only once complete, so they come from the final message.
+    // (eager_input_streaming, which streams them unvalidated and sooner, stays off.)
+    // After a server-side fallback the next model continues the same reply, so
+    // the deltas still add up to the final text.
+    const { onTextDelta } = request;
+    if (onTextDelta) stream.on("text", (delta) => onTextDelta(delta));
+    return fromAnthropicResponse(await stream.finalMessage());
   }
 }
 

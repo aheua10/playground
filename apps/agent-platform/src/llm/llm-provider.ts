@@ -9,6 +9,7 @@ import type { ToolDefinition } from "../core/tool-definition.ts";
 //             messages      the full neutral history (the API is stateless)
 //             tools         what the model MAY ask for; offering is not authorizing
 //             signal        cancellation (client gone, timeout, later: task cancelled)
+//             onTextDelta   optional: reply text as it is generated, for realtime clients
 //
 //   response  message       reply text and/or tool-call REQUESTS (never executed here)
 //             stopReason    why generation ended; the runtime branches on it
@@ -24,6 +25,12 @@ export interface LLMRequest {
   messages: Message[];
   tools: ToolDefinition[];
   signal?: AbortSignal;
+  /**
+   * Called with each piece of reply text as the model produces it. Only an
+   * observer: the returned response is authoritative, and a provider that
+   * can't stream may never call it.
+   */
+  onTextDelta?: (text: string) => void;
 }
 
 export type StopReason =

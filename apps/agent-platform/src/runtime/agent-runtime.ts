@@ -97,6 +97,13 @@ export class AgentRuntime {
           log,
           conversationId,
           turnId,
+          observer: {
+            onTextDelta: (text) => publish({ type: "reply.delta", text }),
+            onToolCall: (call) =>
+              publish({ type: "tool.called", toolCallId: call.id, name: call.name, input: call.input }),
+            onToolResult: (result) =>
+              publish({ type: "tool.finished", toolCallId: result.toolCallId, name: result.toolName, isError: result.isError }),
+          },
         });
         // Persisted only now, as a unit: a failed or cancelled turn leaves
         // history untouched.

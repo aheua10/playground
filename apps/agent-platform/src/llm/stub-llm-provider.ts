@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import type { AssistantMessage, Message } from "../core/messages.ts";
 import type { ToolDefinition } from "../core/tool-definition.ts";
 import type { LLMProvider, LLMRequest, LLMResponse } from "./llm-provider.ts";
@@ -15,6 +16,9 @@ import type { LLMProvider, LLMRequest, LLMResponse } from "./llm-provider.ts";
 // As the coding worker (recognised by being offered write_file): it writes a
 // NOTES.md with the requirements, runs one command if run_command is offered,
 // then summarizes. Enough to exercise the worker, workspace and sandbox.
+//
+// Reply text is streamed word by word through onTextDelta, like a real model,
+// optionally with a delay between words so streaming is visible in a demo.
 
 type RuleContext = { latestTaskId: string | undefined; tools: ToolDefinition[] };
 
@@ -69,9 +73,26 @@ function offeredRepositories(tools: ToolDefinition[]): string[] {
 
 export class StubLLMProvider implements LLMProvider {
   readonly name = "stub";
+  readonly #wordDelayMs: number;
   #callCount = 0;
 
+  constructor(options: { wordDelayMs?: number } = {}) {
+    this.#wordDelayMs = options.wordDelayMs ?? 0;
+  }
+
   async generate(request: LLMRequest): Promise<LLMResponse> {
+    const response = this.#decide(request);
+    const { content } = response.message;
+    if (request.onTextDelta && content) {
+      for (const word of content.split(/(?<=\s)/)) {
+        if (this.#wordDelayMs > 0) await sleep(this.#wordDelayMs, undefined, { signal: request.signal });
+        request.onTextDelta(word);
+      }
+    }
+    return response;
+  }
+
+  #decide(request: LLMRequest): LLMResponse {
     const offered = new Set(request.tools.map((tool) => tool.name));
     if (offered.has("write_file")) return this.#actAsCodingWorker(request, offered);
 

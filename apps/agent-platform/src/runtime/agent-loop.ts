@@ -1,4 +1,4 @@
-import type { Message, UserMessage } from "../core/messages.ts";
+import type { Message, ToolCall, ToolResultMessage, UserMessage } from "../core/messages.ts";
 import type { LLMProvider, StopReason } from "../llm/llm-provider.ts";
 import type { Logger } from "../logger.ts";
 import type { ToolExecutor } from "../tools/tool-executor.ts";
@@ -18,6 +18,16 @@ import type { ToolExecutor } from "../tools/tool-executor.ts";
 // The LLM DECIDES which actions it wants. The loop CONTROLS whether and how
 // they run (ToolExecutor) and how many steps are allowed. It persists nothing;
 // the caller decides what to keep.
+//
+// An optional observer sees the run as it happens (reply text, tool calls,
+// tool results), which is how realtime clients follow a turn. It only watches.
+
+/** Hooks for following a run live. They can't change what the loop does. */
+export interface AgentLoopObserver {
+  onTextDelta?: (text: string) => void;
+  onToolCall?: (call: ToolCall) => void;
+  onToolResult?: (result: ToolResultMessage) => void;
+}
 
 export interface AgentLoopInput {
   llm: LLMProvider;
@@ -34,6 +44,7 @@ export interface AgentLoopInput {
   conversationId: string;
   /** Identifies this run: a conversation turn, or a task attempt. */
   turnId: string;
+  observer?: AgentLoopObserver;
 }
 
 export interface AgentLoopResult {
@@ -47,7 +58,7 @@ export class StepLimitExceededError extends Error {
 }
 
 export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResult> {
-  const { llm, systemPrompt, toolExecutor, maxSteps, signal, log } = input;
+  const { llm, systemPrompt, toolExecutor, maxSteps, signal, log, observer } = input;
   const messages: Message[] = [input.userMessage];
 
   for (let step = 1; step <= maxSteps; step++) {
@@ -64,7 +75,13 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     stepLog.debug("llm.request.payload", { systemPrompt, tools, messages: context });
 
     const llmStartedAt = performance.now();
-    const response = await llm.generate({ systemPrompt, messages: context, tools, signal });
+    const response = await llm.generate({
+      systemPrompt,
+      messages: context,
+      tools,
+      signal,
+      onTextDelta: observer?.onTextDelta,
+    });
     const { message, stopReason } = response;
     stepLog.info("llm.response", {
       model: response.model,
@@ -90,14 +107,15 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     // Run the requested tools one at a time, in order. Sequential is the
     // safe default once tools have side effects; parallelism can come later.
     for (const call of message.toolCalls) {
-      messages.push(
-        await toolExecutor.execute(call, {
-          conversationId: input.conversationId,
-          turnId: input.turnId,
-          signal,
-          log: stepLog,
-        }),
-      );
+      observer?.onToolCall?.(call);
+      const result = await toolExecutor.execute(call, {
+        conversationId: input.conversationId,
+        turnId: input.turnId,
+        signal,
+        log: stepLog,
+      });
+      observer?.onToolResult?.(result);
+      messages.push(result);
     }
   }
 

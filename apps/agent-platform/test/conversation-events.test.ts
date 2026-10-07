@@ -8,9 +8,17 @@ import { AgentRuntime } from "../src/runtime/agent-runtime.ts";
 import { TaskManager } from "../src/tasks/task-manager.ts";
 import { InMemoryTaskStore } from "../src/tasks/task-store.ts";
 import { TaskFailedError } from "../src/tasks/task-worker.ts";
+import { createGetCurrentTimeTool } from "../src/tools/get-current-time.ts";
 import { ToolExecutor } from "../src/tools/tool-executor.ts";
 import { ToolRegistry } from "../src/tools/tool-registry.ts";
-import { captureLogger, ControlledWorker, eventually, ScriptedLLMProvider, textResponse } from "./helpers.ts";
+import {
+  captureLogger,
+  ControlledWorker,
+  eventually,
+  FIXED_NOW,
+  ScriptedLLMProvider,
+  textResponse,
+} from "./helpers.ts";
 
 function record(events: ConversationEvents, conversationId: string): ConversationEvent[] {
   const seen: ConversationEvent[] = [];
@@ -21,7 +29,9 @@ function record(events: ConversationEvents, conversationId: string): Conversatio
 function runtimeWith(llm: LLMProvider) {
   const { logger, events: logEvents } = captureLogger();
   const events = new ConversationEvents(logger);
-  const toolExecutor = new ToolExecutor({ registry: new ToolRegistry() });
+  const registry = new ToolRegistry();
+  registry.register(createGetCurrentTimeTool(() => FIXED_NOW));
+  const toolExecutor = new ToolExecutor({ registry });
   const runtime = new AgentRuntime({ llm, store: new InMemoryConversationStore(), toolExecutor, logger, events });
   return { runtime, events, logEvents };
 }
@@ -69,16 +79,34 @@ test("unsubscribing the last listener forgets the conversation", () => {
   assert.equal(seen.length, 0);
 });
 
-test("a turn publishes started, then completed with the reply", async () => {
+test("a turn publishes started, its reply as it streams, then completed", async () => {
   const { runtime, events } = runtimeWith(new StubLLMProvider());
   const seen = record(events, "c1");
 
-  const result = await runtime.runTurn({ conversationId: "c1", text: "hello" });
+  const result = await runtime.runTurn({ conversationId: "c1", text: "hello there" });
 
-  assert.deepEqual(seen, [
-    { type: "turn.started", conversationId: "c1", turnId: result.turnId, text: "hello" },
-    { type: "turn.completed", conversationId: "c1", turnId: result.turnId, reply: result.reply },
-  ]);
+  const { turnId } = result;
+  assert.deepEqual(seen.at(0), { type: "turn.started", conversationId: "c1", turnId, text: "hello there" });
+  assert.deepEqual(seen.at(-1), { type: "turn.completed", conversationId: "c1", turnId, reply: result.reply });
+  const deltas = seen.slice(1, -1);
+  assert.ok(deltas.length > 1, "streamed in pieces");
+  assert.equal(deltas.map((e) => (e.type === "reply.delta" && e.turnId === turnId ? e.text : "?")).join(""), result.reply);
+});
+
+test("tool calls and their outcomes are published as they happen", async () => {
+  const { runtime, events } = runtimeWith(new StubLLMProvider());
+  const seen = record(events, "c1");
+
+  const result = await runtime.runTurn({ conversationId: "c1", text: "What time is it in Asia/Tokyo?" });
+
+  const types = seen.map((e) => e.type).filter((type, i, all) => type !== all[i - 1]); // collapse delta runs
+  assert.deepEqual(types, ["turn.started", "tool.called", "tool.finished", "reply.delta", "turn.completed"]);
+  const called = seen.find((e) => e.type === "tool.called");
+  const finished = seen.find((e) => e.type === "tool.finished");
+  assert.ok(called?.type === "tool.called" && finished?.type === "tool.finished");
+  assert.deepEqual([called.name, called.input], ["get_current_time", { timeZone: "Asia/Tokyo" }]);
+  assert.deepEqual([finished.toolCallId, finished.isError], [called.toolCallId, false]);
+  assert.match(result.reply, /get_current_time returned/);
 });
 
 test("failed and cancelled turns publish turn.failed with the reason only", async () => {
