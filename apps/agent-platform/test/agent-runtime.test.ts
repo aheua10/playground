@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { InMemoryConversationStore } from "../src/conversation/in-memory-conversation-store.ts";
-import type { LLMProvider } from "../src/llm/llm-provider.ts";
+import type { LLMProvider, LLMRequest } from "../src/llm/llm-provider.ts";
 import { StubLLMProvider } from "../src/llm/stub-llm-provider.ts";
 import { AgentRuntime } from "../src/runtime/agent-runtime.ts";
 import { createGetCurrentTimeTool } from "../src/tools/get-current-time.ts";
 import { ToolExecutor } from "../src/tools/tool-executor.ts";
 import { ToolRegistry } from "../src/tools/tool-registry.ts";
-import { captureLogger, FIXED_NOW, ScriptedLLMProvider, textResponse, toolCallResponse } from "./helpers.ts";
+import { captureLogger, eventually, FIXED_NOW, ScriptedLLMProvider, textResponse, toolCallResponse } from "./helpers.ts";
 
 function setup(llm: LLMProvider, maxSteps?: number) {
   const { logger, lines, events } = captureLogger();
@@ -120,6 +120,37 @@ test("tool calls in a truncated response are never executed", async () => {
   await assert.rejects(runtime.runTurn({ conversationId: "a", text: "time?" }), /stopped with "max_tokens"/);
 
   assert.ok(!events().includes("tool.request"));
+});
+
+test("turns in one conversation run one at a time; other conversations don't wait", async () => {
+  const { promise: gate, resolve: openGate } = Promise.withResolvers<void>();
+  const requests: LLMRequest[] = [];
+  const llm: LLMProvider = {
+    name: "gated",
+    generate: async (request) => {
+      const call = requests.push(request);
+      if (call === 1) await gate; // hold the first turn mid-LLM-call
+      return textResponse(`reply ${call}`);
+    },
+  };
+  const { runtime, events } = setup(llm);
+
+  const first = runtime.runTurn({ conversationId: "a", text: "one" });
+  await eventually(() => requests.length === 1);
+  const second = runtime.runTurn({ conversationId: "a", text: "two" });
+  await runtime.runTurn({ conversationId: "b", text: "other" });
+
+  // "b" ran while "a" was busy; a's second turn is still waiting.
+  assert.equal(requests.length, 2);
+  assert.ok(events().includes("turn.waiting"));
+
+  openGate();
+  await Promise.all([first, second]);
+  // The second turn started after the first was saved, so it saw its messages.
+  assert.deepEqual(
+    requests[2]!.messages.map((m) => m.role === "user" || m.role === "assistant" ? m.content : m.role),
+    ["one", "reply 1", "two"],
+  );
 });
 
 test("cancelling mid-LLM-call aborts the turn, logs it, and persists nothing", async () => {

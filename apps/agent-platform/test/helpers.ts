@@ -46,3 +46,12 @@ export function captureLogger() {
 }
 
 export const FIXED_NOW = new Date("2026-10-07T12:00:00.000Z");
+
+/** Polls until `check` passes; for effects that happen in the background. */
+export async function eventually(check: () => boolean | Promise<boolean>, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() > deadline) throw new Error("Condition not met in time");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
